@@ -40,20 +40,23 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
-DEVICE_DEFAULT_ADDRESS              = '00:00:00:00:00:00'
-DEVICE_DEFAULT_ADVERTISING_INTERVAL = 1000  # ms
-DEVICE_DEFAULT_ADVERTISING_DATA     = ''
-DEVICE_DEFAULT_NAME                 = 'Bumble'
-DEVICE_DEFAULT_INQUIRY_LENGTH       = 8  # 10.24 seconds
-DEVICE_DEFAULT_CLASS_OF_DEVICE      = 0
-DEVICE_DEFAULT_SCAN_RESPONSE_DATA   = b''
-DEVICE_DEFAULT_DATA_LENGTH          = (27, 328, 27, 328)
-DEVICE_DEFAULT_SCAN_INTERVAL        = 60  # ms
-DEVICE_DEFAULT_SCAN_WINDOW          = 60  # ms
-DEVICE_MIN_SCAN_INTERVAL            = 25
-DEVICE_MAX_SCAN_INTERVAL            = 10240
-DEVICE_MIN_SCAN_WINDOW              = 25
-DEVICE_MAX_SCAN_WINDOW              = 10240
+DEVICE_DEFAULT_ADDRESS               = '00:00:00:00:00:00'
+DEVICE_DEFAULT_ADVERTISING_INTERVAL  = 1000  # ms
+DEVICE_DEFAULT_ADVERTISING_DATA      = ''
+DEVICE_DEFAULT_NAME                  = 'Bumble'
+DEVICE_DEFAULT_INQUIRY_LENGTH        = 8  # 10.24 seconds
+DEVICE_DEFAULT_CLASS_OF_DEVICE       = 0
+DEVICE_DEFAULT_SCAN_RESPONSE_DATA    = b''
+DEVICE_DEFAULT_DATA_LENGTH           = (27, 328, 27, 328)
+DEVICE_DEFAULT_SCAN_INTERVAL         = 60  # ms
+DEVICE_DEFAULT_SCAN_WINDOW           = 60  # ms
+DEVICE_DEFAULT_L2CAP_COC_MTU         = 2046
+DEVICE_DEFAULT_L2CAP_COC_MPS         = 2048
+DEVICE_DEFAULT_L2CAP_COC_MAX_CREDITS = 16
+DEVICE_MIN_SCAN_INTERVAL             = 25
+DEVICE_MAX_SCAN_INTERVAL             = 10240
+DEVICE_MIN_SCAN_WINDOW               = 25
+DEVICE_MAX_SCAN_WINDOW               = 10240
 
 # -----------------------------------------------------------------------------
 # Classes
@@ -230,6 +233,15 @@ class Connection(CompositeEventEmitter):
             conn_latency,
             supervision_timeout
         )
+
+    async def open_l2cap_coc(
+        self,
+        psm,
+        mtu=DEVICE_DEFAULT_L2CAP_COC_MTU,
+        mps=DEVICE_DEFAULT_L2CAP_COC_MPS,
+        max_credits=DEVICE_DEFAULT_L2CAP_COC_MAX_CREDITS
+    ):
+        return await self.device.open_l2cap_coc(self, psm, mtu, mps, max_credits)
 
     def __str__(self):
         return f'Connection(handle=0x{self.handle:04X}, role={self.role_name}, address={self.peer_address})'
@@ -453,14 +465,17 @@ class Device(CompositeEventEmitter):
         if connection := self.connections.get(connection_handle):
             return connection
 
-    def register_l2cap_server(self, psm, server):
-        self.l2cap_channel_manager.register_server(psm, server)
-
     def create_l2cap_connector(self, connection, psm):
         return lambda: self.l2cap_channel_manager.connect(connection, psm)
 
     def create_l2cap_registrar(self, psm):
         return lambda handler: self.register_l2cap_server(psm, handler)
+
+    def register_l2cap_server(self, psm, server):
+        self.l2cap_channel_manager.register_server(psm, server)
+
+    def register_l2cap_le_coc_server(self, psm, server):
+        self.l2cap_channel_manager.register_le_coc_server(psm, server)
 
     def send_l2cap_pdu(self, connection_handle, cid, pdu):
         self.host.send_l2cap_pdu(connection_handle, cid, pdu)
@@ -1049,6 +1064,16 @@ class Device(CompositeEventEmitter):
 
     def add_services(self, services):
         self.gatt_server.add_services(services)
+
+    async def open_l2cap_coc(
+        self,
+        connection,
+        psm,
+        mtu=DEVICE_DEFAULT_L2CAP_COC_MTU,
+        mps=DEVICE_DEFAULT_L2CAP_COC_MPS,
+        max_credits=DEVICE_DEFAULT_L2CAP_COC_MAX_CREDITS
+    ):
+        return await self.l2cap_channel_manager.open_l2cap_coc(connection, psm, mtu, mps, max_credits)
 
     async def notify_subscriber(self, connection, attribute, force=False):
         await self.gatt_server.notify_subscriber(connection, attribute, force)

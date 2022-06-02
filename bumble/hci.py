@@ -1743,9 +1743,10 @@ class HCI_Write_Voice_Setting_Command(HCI_Command):
 
 
 # -----------------------------------------------------------------------------
+@HCI_Command.command()
 class HCI_Read_Synchronous_Flow_Control_Enable_Command(HCI_Command):
     '''
-    See Bluetooth spec @ 7.3.36 Write Synchronous Flow Control Enable Command
+    See Bluetooth spec @ 7.3.36 Read Synchronous Flow Control Enable Command
     '''
 
 
@@ -2351,6 +2352,21 @@ class HCI_LE_Remote_Connection_Parameter_Request_Reply_Command(HCI_Command):
 class HCI_LE_Remote_Connection_Parameter_Request_Negative_Reply_Command(HCI_Command):
     '''
     See Bluetooth spec @ 7.8.32 LE Remote Connection Parameter Request Negative Reply Command
+    '''
+
+
+# -----------------------------------------------------------------------------
+@HCI_Command.command(
+    fields=[],
+    return_parameters_fields=[
+        ('status',                  STATUS_SPEC),
+        ('suggested_max_tx_octets', 2),
+        ('suggested_max_tx_time',   2)
+    ]
+)
+class HCI_LE_Read_Suggested_Default_Data_Length_Command(HCI_Command):
+    '''
+    See Bluetooth spec @ 7.8.34 LE Read Suggested Default Data Length Command
     '''
 
 

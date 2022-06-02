@@ -214,7 +214,9 @@ class Server(EventEmitter):
         # Notify for each connection
         if connections:
             await asyncio.wait([
-                self.notify_subscriber(connection, attribute, force)
+                asyncio.create_task(
+                    self.notify_subscriber(connection, attribute, force)
+                )
                 for connection in connections
             ])
 

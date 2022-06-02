@@ -82,6 +82,8 @@ class Host(EventEmitter):
         self.acl_packet_queue                 = collections.deque()
         self.acl_packets_in_flight            = 0
         self.local_supported_commands         = bytes(64)
+        self.suggested_max_tx_octets          = 251   # Max allowed
+        self.suggested_max_tx_time            = 2120  # Max allowed
         self.command_semaphore                = asyncio.Semaphore(1)
         self.long_term_key_provider           = None
         self.link_key_provider                = None
@@ -124,6 +126,14 @@ class Host(EventEmitter):
                 logger.debug(f'HCI LE ACL flow control: hc_le_acl_data_packet_length={self.hc_le_acl_data_packet_length}, hc_total_num_le_acl_data_packets={self.hc_total_num_le_acl_data_packets}')
             else:
                 logger.warn(f'HCI_Read_Buffer_Size_Command failed: {response.return_parameters.status}')
+        response = await self.send_command(HCI_LE_Read_Suggested_Default_Data_Length_Command())
+        suggested_max_tx_octets = response.return_parameters.suggested_max_tx_octets
+        suggested_max_tx_time   = response.return_parameters.suggested_max_tx_time
+        if suggested_max_tx_octets != self.suggested_max_tx_octets or suggested_max_tx_time != self.suggested_max_tx_time:
+            await self.send_command(HCI_LE_Write_Suggested_Default_Data_Length_Command(
+                suggested_max_tx_octets = self.suggested_max_tx_octets,
+                suggested_max_tx_time   = self.suggested_max_tx_time
+            ))
 
         self.reset_done = True
 

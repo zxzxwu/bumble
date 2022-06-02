@@ -23,6 +23,7 @@
 # Imports
 # -----------------------------------------------------------------------------
 import logging
+from pyee import EventEmitter
 from colors import color
 
 from .core import *
