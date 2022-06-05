@@ -178,7 +178,7 @@ class L2CAP_Control_Frame:
         self.identifier = pdu[1]
         length = struct.unpack_from('<H', pdu, 2)[0]
         if length + 4 != len(pdu):
-            logger.warn(color(f'!!! length mismatch: expected {len(pdu) - 4} but got {length}', 'red'))
+            logger.warning(color(f'!!! length mismatch: expected {len(pdu) - 4} but got {length}', 'red'))
         if hasattr(self, 'fields'):
             self.init_from_bytes(pdu, 4)
         return self
@@ -616,7 +616,7 @@ class Channel(EventEmitter):
         elif self.sink:
             self.sink(pdu)
         else:
-            logger.warn(color('received pdu without a pending request or sink', 'red'))
+            logger.warning(color('received pdu without a pending request or sink', 'red'))
 
     async def connect(self):
         if self.state != Channel.CLOSED:
@@ -693,7 +693,7 @@ class Channel(EventEmitter):
 
     def on_connection_response(self, response):
         if self.state != Channel.WAIT_CONNECT_RSP:
-            logger.warn(color('invalid state', 'red'))
+            logger.warning(color('invalid state', 'red'))
             return
 
         if response.result == L2CAP_Connection_Response.CONNECTION_SUCCESSFUL:
@@ -719,7 +719,7 @@ class Channel(EventEmitter):
             self.state != Channel.WAIT_CONFIG_REQ and
             self.state != Channel.WAIT_CONFIG_REQ_RSP
         ):
-            logger.warn(color('invalid state', 'red'))
+            logger.warning(color('invalid state', 'red'))
             return
 
         # Decode the options
@@ -762,7 +762,7 @@ class Channel(EventEmitter):
                     self.connection_result = None
                 self.emit('open')
             else:
-                logger.warn(color('invalid state', 'red'))
+                logger.warning(color('invalid state', 'red'))
         elif response.result == L2CAP_Configure_Response.FAILURE_UNACCEPTABLE_PARAMETERS:
             # Re-configure with what's suggested in the response
             self.send_control_frame(
@@ -774,7 +774,7 @@ class Channel(EventEmitter):
                 )
             )
         else:
-            logger.warn(color(f'!!! configuration rejected: {L2CAP_Configure_Response.result_name(response.result)}', 'red'))
+            logger.warning(color(f'!!! configuration rejected: {L2CAP_Configure_Response.result_name(response.result)}', 'red'))
             # TODO: decide how to fail gracefully
 
     def on_disconnection_request(self, request):
@@ -790,15 +790,15 @@ class Channel(EventEmitter):
             self.emit('close')
             self.manager.on_channel_closed(self)
         else:
-            logger.warn(color('invalid state', 'red'))
+            logger.warning(color('invalid state', 'red'))
 
     def on_disconnection_response(self, response):
         if self.state != Channel.WAIT_DISCONNECT:
-            logger.warn(color('invalid state', 'red'))
+            logger.warning(color('invalid state', 'red'))
             return
 
         if response.destination_cid != self.destination_cid or response.source_cid != self.source_cid:
-            logger.warn('unexpected source or destination CID')
+            logger.warning('unexpected source or destination CID')
             return
 
         self.change_state(Channel.CLOSED)
@@ -874,6 +874,9 @@ class LeConnectionOrientedChannel(EventEmitter):
         self.sink                   = None
         self.connection_result      = None
         self.disconnection_result   = None
+        self.drained                = asyncio.Event()
+
+        self.drained.set()
 
         if connected:
             self.state = LeConnectionOrientedChannel.CONNECTED
@@ -1048,11 +1051,11 @@ class LeConnectionOrientedChannel(EventEmitter):
 
     def on_disconnection_response(self, response):
         if self.state != self.DISCONNECTING:
-            logger.warn(color('invalid state', 'red'))
+            logger.warning(color('invalid state', 'red'))
             return
 
         if response.destination_cid != self.destination_cid or response.source_cid != self.source_cid:
-            logger.warn('unexpected source or destination CID')
+            logger.warning('unexpected source or destination CID')
             return
 
         self.change_state(self.DISCONNECTED)
@@ -1099,6 +1102,7 @@ class LeConnectionOrientedChannel(EventEmitter):
                 self.out_sdu = struct.pack('<H', len(payload)) + payload
             else:
                 # Nothing left to send for now
+                self.drained.set()
                 return
 
     def write(self, data):
@@ -1108,14 +1112,14 @@ class LeConnectionOrientedChannel(EventEmitter):
 
         # Queue the data
         self.out_queue.append(data)
+        self.drained.clear()
         logger.debug(f'{len(data)} bytes packet queued, {len(self.out_queue)} packets in queue')
 
         # Send what we can
         self.process_output()
 
     async def drain(self):
-        # TODO
-        pass
+        await self.drained.wait()
 
     def __str__(self):
         return f'CoC({self.source_cid}->{self.destination_cid}, State={self.state_name(self.state)}, PSM={self.le_psm}, MTU={self.mtu}/{self.peer_mtu}, MPS={self.mps}/{self.peer_mps}, credits={self.credits}/{self.peer_credits})'
@@ -1203,7 +1207,7 @@ class ChannelManager:
             self.on_control_frame(connection, cid, control_frame)
         else:
             if (channel := self.find_channel(connection.handle, cid)) is None:
-                logger.warn(color(f'channel not found for 0x{connection.handle:04X}:{cid}', 'red'))
+                logger.warning(color(f'channel not found for 0x{connection.handle:04X}:{cid}', 'red'))
                 return
 
             channel.on_pdu(pdu)
@@ -1279,7 +1283,7 @@ class ChannelManager:
             server(channel)
             channel.on_connection_request(request)
         else:
-            logger.warn(f'No server for connection 0x{connection.handle:04X} on PSM {request.psm}')
+            logger.warning(f'No server for connection 0x{connection.handle:04X} on PSM {request.psm}')
             self.send_control_frame(
                 connection,
                 cid,
@@ -1294,35 +1298,35 @@ class ChannelManager:
 
     def on_l2cap_connection_response(self, connection, cid, response):
         if (channel := self.find_channel(connection.handle, response.source_cid)) is None:
-            logger.warn(color(f'channel {response.source_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
+            logger.warning(color(f'channel {response.source_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
             return
 
         channel.on_connection_response(response)
 
     def on_l2cap_configure_request(self, connection, cid, request):
         if (channel := self.find_channel(connection.handle, request.destination_cid)) is None:
-            logger.warn(color(f'channel {request.destination_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
+            logger.warning(color(f'channel {request.destination_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
             return
 
         channel.on_configure_request(request)
 
     def on_l2cap_configure_response(self, connection, cid, response):
         if (channel := self.find_channel(connection.handle, response.source_cid)) is None:
-            logger.warn(color(f'channel {response.source_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
+            logger.warning(color(f'channel {response.source_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
             return
 
         channel.on_configure_response(response)
 
     def on_l2cap_disconnection_request(self, connection, cid, request):
         if (channel := self.find_channel(connection.handle, request.destination_cid)) is None:
-            logger.warn(color(f'channel {request.destination_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
+            logger.warning(color(f'channel {request.destination_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
             return
 
         channel.on_disconnection_request(request)
 
     def on_l2cap_disconnection_response(self, connection, cid, response):
         if (channel := self.find_channel(connection.handle, response.source_cid)) is None:
-            logger.warn(color(f'channel {response.source_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
+            logger.warning(color(f'channel {response.source_cid} not found for 0x{connection.handle:04X}:{cid}', 'red'))
             return
 
         channel.on_disconnection_response(response)
@@ -1404,7 +1408,7 @@ class ChannelManager:
             # Check that the CID isn't already used
             le_connection_channels = self.le_channels.setdefault(connection.handle, {})
             if request.source_cid in le_connection_channels:
-                logger.warn(f'source CID {request.source_cid} already in use')
+                logger.warning(f'source CID {request.source_cid} already in use')
                 self.send_control_frame(
                     connection,
                     cid,
@@ -1498,7 +1502,7 @@ class ChannelManager:
         # Find the channel for this request
         channel = self.find_channel(connection.handle, request.source_cid)
         if channel is None:
-            logger.warn(color(f'received connection response for an unknown channel (cid={request.source_cid})', 'red'))
+            logger.warning(color(f'received connection response for an unknown channel (cid={request.source_cid})', 'red'))
             return
 
         # Process the response
@@ -1507,7 +1511,7 @@ class ChannelManager:
     def on_l2cap_le_flow_control_credit(self, connection, cid, credit):
         channel = self.find_le_channel(connection.handle, credit.cid)
         if channel is None:
-            logger.warn(f'received credits for an unknown channel (cid={credit.cid}')
+            logger.warning(f'received credits for an unknown channel (cid={credit.cid}')
             return
 
         channel.on_credits(credit.credits)
@@ -1547,8 +1551,9 @@ class ChannelManager:
         try:
             await channel.connect()
         except Exception as error:
-            logger.warn(f'connection failed: {error}')
+            logger.warning(f'connection failed: {error}')
             del connection_channels[source_cid]
+            raise
 
         # Remember the channel by source CID and destination CID
         le_connection_channels = self.le_channels.setdefault(connection.handle, {})
