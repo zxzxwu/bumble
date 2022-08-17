@@ -442,8 +442,9 @@ class Device(CompositeEventEmitter):
         self.auto_restart_advertising = False
         self.command_timeout          = 10  # seconds
         self.gatt_server              = gatt_server.Server(self)
-        self.sdp_server               = sdp.Server(self)
-        self.l2cap_channel_manager    = l2cap.ChannelManager()
+        self.sdp_server = sdp.Server(self)
+        self.l2cap_channel_manager     = l2cap.ChannelManager(
+            [l2cap.L2CAP_Information_Request.EXTENDED_FEATURE_FIXED_CHANNELS])
         self.advertisement_data       = {}
         self.scanning                 = False
         self.discovering              = False
@@ -487,6 +488,8 @@ class Device(CompositeEventEmitter):
         # Setup SMP
         # TODO: allow using a public address
         self.smp_manager = smp.Manager(self, self.random_address)
+        self.l2cap_channel_manager.register_fixed_channel(
+            smp.SMP_CID, self.on_smp_pdu)
 
         # Register the SDP server with the L2CAP Channel Manager
         self.sdp_server.register(self.l2cap_channel_manager)
@@ -494,6 +497,7 @@ class Device(CompositeEventEmitter):
         # Add a GAP Service if requested
         if generic_access_service:
             self.gatt_server.add_service(GenericAccessService(self.name))
+        self.l2cap_channel_manager.register_fixed_channel(ATT_CID, self.on_gatt_pdu)
 
         # Forward some events
         setup_event_forwarding(self.gatt_server, self, 'characteristic_subscription')
@@ -620,6 +624,7 @@ class Device(CompositeEventEmitter):
                 HCI_Write_Secure_Connections_Host_Support_Command(
                     secure_connections_host_support=int(self.classic_sc_enabled))
             )
+            await self.set_connectable()
 
         # Let the SMP manager know about the address
         # TODO: allow using a public address
@@ -1496,7 +1501,7 @@ class Device(CompositeEventEmitter):
 
     @host_event_handler
     @with_connection_from_handle
-    def on_gatt_pdu(self, connection, pdu):
+    def on_gatt_pdu(self, connection, cid, pdu):
         # Parse the L2CAP payload into an ATT PDU object
         att_pdu = ATT_PDU.from_bytes(pdu)
 
@@ -1515,7 +1520,7 @@ class Device(CompositeEventEmitter):
 
     @host_event_handler
     @with_connection_from_handle
-    def on_smp_pdu(self, connection, pdu):
+    def on_smp_pdu(self, connection, cid, pdu):
         self.smp_manager.on_smp_pdu(connection, pdu)
 
     @host_event_handler
