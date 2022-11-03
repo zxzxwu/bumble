@@ -577,13 +577,7 @@ class Host(EventEmitter):
         logger.debug(f'simple pairing complete for {event.bd_addr}: status={HCI_Constant.status_name(event.status)}')
 
     def on_hci_pin_code_request_event(self, event):
-        # For now, just refuse all requests
-        # TODO: delegate the decision
-        self.send_command_sync(
-            HCI_PIN_Code_Request_Negative_Reply_Command(
-                bd_addr = event.bd_addr
-            )
-        )
+        self.emit('pin_code_request', event.bd_addr, BT_BR_EDR_TRANSPORT)
 
     def on_hci_link_key_request_event(self, event):
         async def send_link_key():

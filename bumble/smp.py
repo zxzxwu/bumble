@@ -486,6 +486,9 @@ class PairingDelegate:
     async def display_number(self, number, digits=6):
         pass
 
+    async def get_pin_code(self):
+        return b''
+
     async def key_distribution_response(self, peer_initiator_key_distribution, peer_responder_key_distribution):
         return (
             (peer_initiator_key_distribution &

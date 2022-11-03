@@ -1974,6 +1974,26 @@ class Device(CompositeEventEmitter):
         connection.data_length = (max_tx_octets, max_tx_time, max_rx_octets, max_rx_time)
         connection.emit('connection_data_length_change')
 
+    @host_event_handler
+    @with_connection_from_address
+    def on_pin_code_request(self, connection):
+        pairing_config = self.pairing_config_factory(connection)
+
+        async def get_pin_code():
+            pin_code = await pairing_config.delegate.get_pin_code()
+            if pin_code is not None:
+                self.host.send_command_sync(
+                    HCI_PIN_Code_Request_Reply_Command(
+                        bd_addr         = connection.peer_address,
+                        pin_code_length = len(pin_code),
+                        pin_code        = pin_code.ljust(16, b'\0'),) # padding to 16 octets
+                )
+            else:
+                self.host.send_command_sync(
+                    HCI_PIN_Code_Request_Negative_Reply_Command(bd_addr=connection.peer_address)
+                )
+        asyncio.create_task(get_pin_code())
+
     @with_connection_from_handle
     def on_pairing_start(self, connection):
         connection.emit('pairing_start')
