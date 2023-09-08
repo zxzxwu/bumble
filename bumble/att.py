@@ -806,16 +806,20 @@ class Attribute(EventEmitter):
     def decode_value(self, value_bytes: bytes) -> bytes:
         return value_bytes
 
-    def read_value(self, connection: Connection) -> bytes:
+    def read_value(self, connection: Connection | None) -> bytes:
         if (
-            self.permissions & self.READ_REQUIRES_ENCRYPTION
-        ) and not connection.encryption:
+            (self.permissions & self.READ_REQUIRES_ENCRYPTION)
+            and connection is not None
+            and not connection.encryption
+        ):
             raise ATT_Error(
                 error_code=ATT_INSUFFICIENT_ENCRYPTION_ERROR, att_handle=self.handle
             )
         if (
-            self.permissions & self.READ_REQUIRES_AUTHENTICATION
-        ) and not connection.authenticated:
+            (self.permissions & self.READ_REQUIRES_AUTHENTICATION)
+            and connection is not None
+            and not connection.authenticated
+        ):
             raise ATT_Error(
                 error_code=ATT_INSUFFICIENT_AUTHENTICATION_ERROR, att_handle=self.handle
             )
@@ -827,7 +831,7 @@ class Attribute(EventEmitter):
 
         if hasattr(self.value, 'read'):
             try:
-                value = read(connection)  # pylint: disable=not-callable
+                value = self.value.read(connection)
             except ATT_Error as error:
                 raise ATT_Error(
                     error_code=error.error_code, att_handle=self.handle
