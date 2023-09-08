@@ -1,0 +1,19 @@
+name: Spellcheck Action
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Spellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Spelling
+        uses: check-spelling/check-spelling@v0.0.21
+  
