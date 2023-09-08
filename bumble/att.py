@@ -211,7 +211,7 @@ class ATT_PDU:
 
     pdu_classes: Dict[int, Type[ATT_PDU]] = {}
     op_code = 0
-    name = None
+    name: str
 
     @staticmethod
     def from_bytes(pdu):

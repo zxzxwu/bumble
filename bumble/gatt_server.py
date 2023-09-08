@@ -354,7 +354,13 @@ class Server(EventEmitter):
         )
         self.send_gatt_pdu(connection.handle, response.to_bytes())
 
-    async def notify_subscriber(self, connection, attribute, value=None, force=False):
+    async def notify_subscriber(
+        self,
+        connection: Connection,
+        attribute: Attribute,
+        value: Optional[bytes] = None,
+        force: bool = False,
+    ) -> None:
         # Check if there's a subscriber
         if not force:
             subscribers = self.subscribers.get(connection.handle)
@@ -391,7 +397,13 @@ class Server(EventEmitter):
         )
         self.send_gatt_pdu(connection.handle, bytes(notification))
 
-    async def indicate_subscriber(self, connection, attribute, value=None, force=False):
+    async def indicate_subscriber(
+        self,
+        connection: Connection,
+        attribute: Attribute,
+        value: Optional[bytes] = None,
+        force: bool = False,
+    ) -> None:
         # Check if there's a subscriber
         if not force:
             subscribers = self.subscribers.get(connection.handle)
@@ -432,15 +444,13 @@ class Server(EventEmitter):
             assert self.pending_confirmations[connection.handle] is None
 
             # Create a future value to hold the eventual response
-            self.pending_confirmations[
+            pending_confirmation = self.pending_confirmations[
                 connection.handle
             ] = asyncio.get_running_loop().create_future()
 
             try:
                 self.send_gatt_pdu(connection.handle, indication.to_bytes())
-                await asyncio.wait_for(
-                    self.pending_confirmations[connection.handle], GATT_REQUEST_TIMEOUT
-                )
+                await asyncio.wait_for(pending_confirmation, GATT_REQUEST_TIMEOUT)
             except asyncio.TimeoutError as error:
                 logger.warning(color('!!! GATT Indicate timeout', 'red'))
                 raise TimeoutError(f'GATT timeout for {indication.name}') from error
@@ -448,8 +458,12 @@ class Server(EventEmitter):
                 self.pending_confirmations[connection.handle] = None
 
     async def notify_or_indicate_subscribers(
-        self, indicate, attribute, value=None, force=False
-    ):
+        self,
+        indicate: bool,
+        attribute: Attribute,
+        value: Optional[bytearray] = None,
+        force: bool = False,
+    ) -> None:
         # Get all the connections for which there's at least one subscription
         connections = [
             connection
@@ -471,10 +485,20 @@ class Server(EventEmitter):
                 ]
             )
 
-    async def notify_subscribers(self, attribute, value=None, force=False):
+    async def notify_subscribers(
+        self,
+        attribute: Attribute,
+        value: Optional[bytearray] = None,
+        force: bool = False,
+    ):
         return await self.notify_or_indicate_subscribers(False, attribute, value, force)
 
-    async def indicate_subscribers(self, attribute, value=None, force=False):
+    async def indicate_subscribers(
+        self,
+        attribute: Attribute,
+        value: Optional[bytearray] = None,
+        force: bool = False,
+    ):
         return await self.notify_or_indicate_subscribers(True, attribute, value, force)
 
     def on_disconnection(self, connection: Connection) -> None:
@@ -485,7 +509,7 @@ class Server(EventEmitter):
         if connection.handle in self.pending_confirmations:
             del self.pending_confirmations[connection.handle]
 
-    def on_gatt_pdu(self, connection, att_pdu):
+    def on_gatt_pdu(self, connection: Connection, att_pdu: ATT_PDU) -> None:
         logger.debug(f'GATT Request to server: [0x{connection.handle:04X}] {att_pdu}')
         handler_name = f'on_{att_pdu.name.lower()}'
         handler = getattr(self, handler_name, None)
@@ -527,7 +551,7 @@ class Server(EventEmitter):
     #######################################################
     # ATT handlers
     #######################################################
-    def on_att_request(self, connection, pdu):
+    def on_att_request(self, connection: Connection, pdu: ATT_PDU) -> None:
         '''
         Handler for requests without a more specific handler
         '''
