@@ -23,13 +23,14 @@
 # Imports
 # -----------------------------------------------------------------------------
 from __future__ import annotations
+import enum
 import functools
 import struct
 from pyee import EventEmitter
-from typing import Dict, Type, TYPE_CHECKING
+from typing import Dict, Type, List, Protocol, TYPE_CHECKING
 
-from bumble.core import UUID, name_or_number, get_dict_key_by_value, ProtocolError
-from bumble.hci import HCI_Object, key_with_value, HCI_Constant
+from bumble.core import UUID, name_or_number, ProtocolError
+from bumble.hci import HCI_Object, key_with_value
 from bumble.colors import color
 
 if TYPE_CHECKING:
@@ -181,6 +182,7 @@ UUID_2_FIELD_SPEC    = lambda x, y: UUID.parse_uuid_2(x, y)  # noqa: E731
 # fmt: on
 # pylint: enable=line-too-long
 # pylint: disable=invalid-name
+
 
 # -----------------------------------------------------------------------------
 # Exceptions
@@ -720,47 +722,67 @@ class ATT_Handle_Value_Confirmation(ATT_PDU):
 
 
 # -----------------------------------------------------------------------------
+class ConnectionValue(Protocol):
+    def read(self, connection) -> bytes:
+        ...
+
+    def write(self, connection, value: bytes) -> None:
+        ...
+
+
+# -----------------------------------------------------------------------------
 class Attribute(EventEmitter):
-    # Permission flags
-    READABLE = 0x01
-    WRITEABLE = 0x02
-    READ_REQUIRES_ENCRYPTION = 0x04
-    WRITE_REQUIRES_ENCRYPTION = 0x08
-    READ_REQUIRES_AUTHENTICATION = 0x10
-    WRITE_REQUIRES_AUTHENTICATION = 0x20
-    READ_REQUIRES_AUTHORIZATION = 0x40
-    WRITE_REQUIRES_AUTHORIZATION = 0x80
+    class Permission(enum.IntFlag):
+        READABLE = 0x01
+        WRITEABLE = 0x02
+        READ_REQUIRES_ENCRYPTION = 0x04
+        WRITE_REQUIRES_ENCRYPTION = 0x08
+        READ_REQUIRES_AUTHENTICATION = 0x10
+        WRITE_REQUIRES_AUTHENTICATION = 0x20
+        READ_REQUIRES_AUTHORIZATION = 0x40
+        WRITE_REQUIRES_AUTHORIZATION = 0x80
 
-    PERMISSION_NAMES = {
-        READABLE: 'READABLE',
-        WRITEABLE: 'WRITEABLE',
-        READ_REQUIRES_ENCRYPTION: 'READ_REQUIRES_ENCRYPTION',
-        WRITE_REQUIRES_ENCRYPTION: 'WRITE_REQUIRES_ENCRYPTION',
-        READ_REQUIRES_AUTHENTICATION: 'READ_REQUIRES_AUTHENTICATION',
-        WRITE_REQUIRES_AUTHENTICATION: 'WRITE_REQUIRES_AUTHENTICATION',
-        READ_REQUIRES_AUTHORIZATION: 'READ_REQUIRES_AUTHORIZATION',
-        WRITE_REQUIRES_AUTHORIZATION: 'WRITE_REQUIRES_AUTHORIZATION',
-    }
+        @classmethod
+        def from_string(cls, permissions_str: str) -> Attribute.Permission:
+            try:
+                return functools.reduce(
+                    lambda x, y: x | Attribute.Permission[y],
+                    permissions_str.split(","),
+                    Attribute.Permission(0),
+                )
+            except TypeError as exc:
+                # The check for `p.name is not None` here is needed because for InFlag
+                # enums, the .name property can be None, when the enum value is 0,
+                # so the type hint for .name is Optional[str].
+                enum_list: List[str] = [p.name for p in cls if p.name is not None]
+                enum_list_str = ",".join(enum_list)
+                raise TypeError(
+                    f"Attribute::permissions error:\nExpected a string containing any of the keys, separated by commas: {enum_list_str  }\nGot: {permissions_str}"
+                ) from exc
 
-    @staticmethod
-    def string_to_permissions(permissions_str: str):
-        try:
-            return functools.reduce(
-                lambda x, y: x | get_dict_key_by_value(Attribute.PERMISSION_NAMES, y),
-                permissions_str.split(","),
-                0,
-            )
-        except TypeError as exc:
-            raise TypeError(
-                f"Attribute::permissions error:\nExpected a string containing any of the keys, separated by commas: {','.join(Attribute.PERMISSION_NAMES.values())}\nGot: {permissions_str}"
-            ) from exc
+    # Permission flags(legacy-use only)
+    READABLE = Permission.READABLE
+    WRITEABLE = Permission.WRITEABLE
+    READ_REQUIRES_ENCRYPTION = Permission.READ_REQUIRES_ENCRYPTION
+    WRITE_REQUIRES_ENCRYPTION = Permission.WRITE_REQUIRES_ENCRYPTION
+    READ_REQUIRES_AUTHENTICATION = Permission.READ_REQUIRES_AUTHENTICATION
+    WRITE_REQUIRES_AUTHENTICATION = Permission.WRITE_REQUIRES_AUTHENTICATION
+    READ_REQUIRES_AUTHORIZATION = Permission.READ_REQUIRES_AUTHORIZATION
+    WRITE_REQUIRES_AUTHORIZATION = Permission.WRITE_REQUIRES_AUTHORIZATION
 
-    def __init__(self, attribute_type, permissions, value=b''):
+    value: int | bytes | ConnectionValue
+
+    def __init__(
+        self,
+        attribute_type: str | bytes | UUID,
+        permissions: str | Permission,
+        value: int | str | bytes | ConnectionValue = b'',
+    ) -> None:
         EventEmitter.__init__(self)
         self.handle = 0
         self.end_group_handle = 0
         if isinstance(permissions, str):
-            self.permissions = self.string_to_permissions(permissions)
+            self.permissions = Attribute.Permission.from_string(permissions)
         else:
             self.permissions = permissions
 
@@ -778,13 +800,13 @@ class Attribute(EventEmitter):
         else:
             self.value = value
 
-    def encode_value(self, value):
+    def encode_value(self, value: bytes) -> bytes:
         return value
 
-    def decode_value(self, value_bytes):
+    def decode_value(self, value_bytes: bytes) -> bytes:
         return value_bytes
 
-    def read_value(self, connection: Connection):
+    def read_value(self, connection: Connection) -> bytes:
         if (
             self.permissions & self.READ_REQUIRES_ENCRYPTION
         ) and not connection.encryption:
@@ -803,7 +825,7 @@ class Attribute(EventEmitter):
                 error_code=ATT_INSUFFICIENT_AUTHORIZATION_ERROR, att_handle=self.handle
             )
 
-        if read := getattr(self.value, 'read', None):
+        if hasattr(self.value, 'read'):
             try:
                 value = read(connection)  # pylint: disable=not-callable
             except ATT_Error as error:
@@ -815,7 +837,7 @@ class Attribute(EventEmitter):
 
         return self.encode_value(value)
 
-    def write_value(self, connection: Connection, value_bytes):
+    def write_value(self, connection: Connection, value_bytes: bytes) -> None:
         if (
             self.permissions & self.WRITE_REQUIRES_ENCRYPTION
         ) and not connection.encryption:
@@ -836,9 +858,9 @@ class Attribute(EventEmitter):
 
         value = self.decode_value(value_bytes)
 
-        if write := getattr(self.value, 'write', None):
+        if hasattr(self.value, 'write'):
             try:
-                write(connection, value)  # pylint: disable=not-callable
+                self.value.write(connection, value)  # pylint: disable=not-callable
             except ATT_Error as error:
                 raise ATT_Error(
                     error_code=error.error_code, att_handle=self.handle
