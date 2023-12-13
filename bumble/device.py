@@ -22,7 +22,14 @@ import json
 import asyncio
 import logging
 import secrets
-from contextlib import asynccontextmanager, AsyncExitStack, closing
+import sys
+from contextlib import (
+    asynccontextmanager,
+    nullcontext,
+    AsyncExitStack,
+    closing,
+    AbstractAsyncContextManager,
+)
 from dataclasses import dataclass, field
 from collections.abc import Iterable
 from typing import (
@@ -959,8 +966,9 @@ class ScoLink(CompositeEventEmitter):
     acl_connection: Connection
     handle: int
     link_type: int
+    sink: Optional[Callable[[HCI_SynchronousDataPacket], Any]] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__init__()
 
     async def disconnect(
@@ -982,8 +990,9 @@ class CisLink(CompositeEventEmitter):
     cis_id: int  # CIS ID assigned by Central device
     cig_id: int  # CIG ID assigned by Central device
     state: State = State.PENDING
+    sink: Optional[Callable[[HCI_IsoDataPacket], Any]] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__init__()
 
     async def disconnect(
@@ -1429,6 +1438,7 @@ class Device(CompositeEventEmitter):
     legacy_advertiser: Optional[LegacyAdvertiser]
     sco_links: Dict[int, ScoLink]
     cis_links: Dict[int, CisLink]
+    _cis_lock: AbstractAsyncContextManager
     _pending_cis: Dict[int, Tuple[int, int]]
 
     @composite_listener
@@ -1528,6 +1538,10 @@ class Device(CompositeEventEmitter):
         self.classic_pending_accepts = {
             Address.ANY: []
         }  # Futures, by BD address OR [Futures] for Address.ANY
+        if sys.version_info >= (3, 10):
+            self._cis_lock = asyncio.Lock()
+        else:
+            self._cis_lock = nullcontext()
 
         # Own address type cache
         self.connect_own_address_type = None
@@ -3425,26 +3439,44 @@ class Device(CompositeEventEmitter):
     # [LE only]
     @experimental('Only for testing.')
     async def accept_cis_request(self, handle: int) -> CisLink:
-        result = await self.send_command(
-            HCI_LE_Accept_CIS_Request_Command(connection_handle=handle),
-        )
-        if result.status != HCI_COMMAND_STATUS_PENDING:
-            logger.warning(
-                'HCI_LE_Accept_CIS_Request_Command failed: '
-                f'{HCI_Constant.error_name(result.status)}'
-            )
-            raise HCI_StatusError(result)
+        """[LE Only] Accepts an incoming CIS request.
 
-        pending_cis_establishment = asyncio.get_running_loop().create_future()
+        When the specified CIS handle is already created, this method returns the
+        existed CIS link object immediately.
 
-        with closing(EventWatcher()) as watcher:
+        Args:
+            handle: CIS handle to accept.
 
-            @watcher.on(self, 'cis_establishment')
-            def on_cis_establishment(cis_link: CisLink) -> None:
-                if cis_link.handle == handle:
-                    pending_cis_establishment.set_result(cis_link)
+        Returns:
+            CIS link object on the given handle.
+        """
+        if not (cis_link := self.cis_links.get(handle)):
+            raise InvalidStateError(f'No pending CIS request of handle {handle}')
 
-            return await pending_cis_establishment
+        if cis_link.state == CisLink.State.ESTABLISHED:
+            return cis_link
+
+        async with self._cis_lock:
+            with closing(EventWatcher()) as watcher:
+                pending_establishment = asyncio.get_running_loop().create_future()
+                watcher.on(
+                    cis_link,
+                    'establishment',
+                    lambda: pending_establishment.set_result(None),
+                )
+
+                result = await self.send_command(
+                    HCI_LE_Accept_CIS_Request_Command(connection_handle=handle),
+                )
+                if result.status != HCI_COMMAND_STATUS_PENDING:
+                    logger.warning(
+                        'HCI_LE_Accept_CIS_Request_Command failed: '
+                        f'{HCI_Constant.error_name(result.status)}'
+                    )
+                    raise HCI_StatusError(result)
+
+                await pending_establishment
+                return cis_link
 
     # [LE only]
     @experimental('Only for testing.')
@@ -4107,8 +4139,8 @@ class Device(CompositeEventEmitter):
     @host_event_handler
     @experimental('Only for testing')
     def on_sco_packet(self, sco_handle: int, packet: HCI_SynchronousDataPacket) -> None:
-        if sco_link := self.sco_links.get(sco_handle):
-            sco_link.emit('pdu', packet)
+        if (sco_link := self.sco_links.get(sco_handle)) and sco_link.sink:
+            sco_link.sink(packet)
 
     # [LE only]
     @host_event_handler
@@ -4171,8 +4203,8 @@ class Device(CompositeEventEmitter):
     @host_event_handler
     @experimental('Only for testing')
     def on_iso_packet(self, handle: int, packet: HCI_IsoDataPacket) -> None:
-        if cis_link := self.cis_links.get(handle):
-            cis_link.emit('pdu', packet)
+        if (cis_link := self.cis_links.get(handle)) and cis_link.sink:
+            cis_link.sink(packet)
 
     @host_event_handler
     @with_connection_from_handle
