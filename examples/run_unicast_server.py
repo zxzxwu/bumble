@@ -48,7 +48,10 @@ from bumble.transport import open_transport_or_link
 # -----------------------------------------------------------------------------
 async def main() -> None:
     if len(sys.argv) < 3:
-        print('Usage: run_cig_setup.py <config-file>' '<transport-spec-for-device>')
+        print(
+            'Usage: run_unicast_server.py <config-file>'
+            '<transport-spec-for-device> [<classic_enabled>=True|False]'
+        )
         return
 
     print('<<< connecting to HCI...')
@@ -59,6 +62,7 @@ async def main() -> None:
             sys.argv[1], hci_transport.source, hci_transport.sink
         )
         device.cis_enabled = True
+        device.classic_enabled = len(sys.argv) >= 4 and sys.argv[3].lower() == 'true'
 
         await device.power_on()
 
@@ -178,7 +182,12 @@ async def main() -> None:
 
         device.once('cis_establishment', on_cis)
 
-        advertising_set = await device.create_advertising_set(
+        await device.create_advertising_set(
+            own_address_type=(
+                OwnAddressType.PUBLIC
+                if device.classic_enabled
+                else OwnAddressType.RANDOM
+            ),
             advertising_data=advertising_data,
         )
 
