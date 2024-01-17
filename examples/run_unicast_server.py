@@ -21,6 +21,7 @@ import sys
 import os
 import struct
 import secrets
+import functools
 from bumble.core import AdvertisingData
 from bumble.device import Device, CisLink, AdvertisingParameters
 from bumble.hci import (
@@ -73,10 +74,16 @@ async def main() -> None:
         device.add_service(CommonAudioServiceService(csis))
         device.add_service(
             PublishedAudioCapabilitiesService(
-                supported_source_context=ContextType.PROHIBITED,
-                available_source_context=ContextType.PROHIBITED,
-                supported_sink_context=ContextType.MEDIA,
-                available_sink_context=ContextType.MEDIA,
+                supported_source_context=ContextType.CONVERSATIONAL
+                | ContextType.RINGTONE,
+                available_source_context=ContextType.CONVERSATIONAL
+                | ContextType.RINGTONE,
+                supported_sink_context=ContextType.MEDIA
+                | ContextType.CONVERSATIONAL
+                | ContextType.RINGTONE,
+                available_sink_context=ContextType.MEDIA
+                | ContextType.CONVERSATIONAL
+                | ContextType.RINGTONE,
                 sink_audio_locations=(
                     AudioLocation.FRONT_LEFT | AudioLocation.FRONT_RIGHT
                 ),
@@ -87,37 +94,48 @@ async def main() -> None:
                         codec_specific_capabilities=CodecSpecificCapabilities(
                             supported_sampling_frequencies=(
                                 SupportedSamplingFrequency.FREQ_16000
+                                | SupportedSamplingFrequency.FREQ_32000
+                                | SupportedSamplingFrequency.FREQ_48000
                             ),
                             supported_frame_durations=(
                                 SupportedFrameDuration.DURATION_10000_US_SUPPORTED
                             ),
-                            supported_audio_channel_counts=[1],
-                            min_octets_per_codec_frame=40,
-                            max_octets_per_codec_frame=40,
-                            supported_max_codec_frames_per_sdu=1,
+                            supported_audio_channel_counts=[1, 2],
+                            min_octets_per_codec_frame=0,
+                            max_octets_per_codec_frame=240,
+                            supported_max_codec_frames_per_sdu=2,
                         ),
                     ),
-                    # Codec Capability Setting 24_2
+                ],
+                source_audio_locations=(
+                    AudioLocation.FRONT_LEFT | AudioLocation.FRONT_RIGHT
+                ),
+                source_pac=[
+                    # Codec Capability Setting 16_2
                     PacRecord(
                         coding_format=CodingFormat(CodecID.LC3),
                         codec_specific_capabilities=CodecSpecificCapabilities(
                             supported_sampling_frequencies=(
-                                SupportedSamplingFrequency.FREQ_48000
+                                SupportedSamplingFrequency.FREQ_16000
+                                | SupportedSamplingFrequency.FREQ_32000
+                                | SupportedSamplingFrequency.FREQ_48000
                             ),
                             supported_frame_durations=(
                                 SupportedFrameDuration.DURATION_10000_US_SUPPORTED
                             ),
-                            supported_audio_channel_counts=[1],
-                            min_octets_per_codec_frame=120,
-                            max_octets_per_codec_frame=120,
-                            supported_max_codec_frames_per_sdu=1,
+                            supported_audio_channel_counts=[1, 2],
+                            min_octets_per_codec_frame=0,
+                            max_octets_per_codec_frame=240,
+                            supported_max_codec_frames_per_sdu=2,
                         ),
                     ),
                 ],
             )
         )
 
-        device.add_service(AudioStreamControlService(device, sink_ase_id=[1, 2]))
+        device.add_service(
+            AudioStreamControlService(device, sink_ase_id=[1, 2], source_ase_id=[3])
+        )
 
         advertising_data = (
             bytes(
@@ -146,41 +164,52 @@ async def main() -> None:
             )
             + csis.get_advertising_data()
         )
-        subprocess = await asyncio.create_subprocess_shell(
-            f'dlc3 | ffplay pipe:0',
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
 
-        stdin = subprocess.stdin
-        assert stdin
-
-        # Write a fake LC3 header to dlc3.
-        stdin.write(
-            bytes([0x1C, 0xCC])  # Header.
-            + struct.pack(
-                '<HHHHHHI',
-                18,  # Header length.
-                48000 // 100,  # Sampling Rate(/100Hz).
-                0,  # Bitrate(unused).
-                1,  # Channels.
-                10000 // 10,  # Frame duration(/10us).
-                0,  # RFU.
-                0x0FFFFFFF,  # Frame counts.
-            )
-        )
-
-        def on_pdu(pdu: HCI_IsoDataPacket):
+        def on_pdu(pdu: HCI_IsoDataPacket, stdin: asyncio.StreamWriter):
             # LC3 format: |frame_length(2)| + |frame(length)|.
             if pdu.iso_sdu_length:
                 stdin.write(struct.pack('<H', pdu.iso_sdu_length))
             stdin.write(pdu.iso_sdu_fragment)
 
         def on_cis(cis_link: CisLink):
-            cis_link.on('pdu', on_pdu)
+            async def on_cis_async():
+                subprocess = await asyncio.create_subprocess_shell(
+                    f'dlc3 | ffplay pipe:0',
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
 
-        device.once('cis_establishment', on_cis)
+                stdin = subprocess.stdin
+                assert stdin
+
+                # Write a fake LC3 header to dlc3.
+                stdin.write(
+                    bytes([0x1C, 0xCC])  # Header.
+                    + struct.pack(
+                        '<HHHHHHI',
+                        18,  # Header length.
+                        16000 // 100,  # Sampling Rate(/100Hz).
+                        0,  # Bitrate(unused).
+                        1,  # Channels.
+                        10000 // 10,  # Frame duration(/10us).
+                        0,  # RFU.
+                        0x0FFFFFFF,  # Frame counts.
+                    )
+                )
+
+                def on_disconnection(*_, subprocess: asyncio.subprocess.Process):
+                    subprocess.terminate()
+
+                cis_link.on('pdu', functools.partial(on_pdu, stdin=stdin))
+                cis_link.on(
+                    'disconnection',
+                    functools.partial(on_disconnection, subprocess=subprocess),
+                )
+
+            device.abort_on('flush', on_cis_async())
+
+        device.on('cis_establishment', on_cis)
 
         await device.create_advertising_set(
             own_address_type=(
