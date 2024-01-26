@@ -23,6 +23,7 @@
 # Imports
 # -----------------------------------------------------------------------------
 from __future__ import annotations
+import abc
 import enum
 import functools
 import logging
@@ -35,8 +36,11 @@ from typing import (
     Optional,
     Sequence,
     Union,
+    Tuple,
+    Generic,
     TYPE_CHECKING,
 )
+from typing_extensions import TypeVarTuple
 
 from bumble.colors import color
 from bumble.core import UUID
@@ -539,7 +543,10 @@ class CharacteristicValue(AttributeValue):
 
 
 # -----------------------------------------------------------------------------
-class CharacteristicAdapter:
+_TT = TypeVarTuple('_TT')
+
+
+class CharacteristicAdapter(abc.ABC, Generic[*_TT]):
     '''
     An adapter that can adapt Characteristic and AttributeProxy objects
     by wrapping their `read_value()` and `write_value()` methods with ones that
@@ -558,7 +565,7 @@ class CharacteristicAdapter:
     read_value: Callable
     write_value: Callable
 
-    def __init__(self, characteristic: Union[Characteristic, AttributeProxy]):
+    def __init__(self, characteristic: Union[Characteristic, AttributeProxy]) -> None:
         self.wrapped_characteristic = characteristic
         self.subscribers: Dict[
             Callable, Callable
@@ -589,29 +596,39 @@ class CharacteristicAdapter:
         else:
             setattr(self.wrapped_characteristic, name, value)
 
-    async def read_encoded_value(self, connection):
+    async def read_encoded_value(self, connection: Optional[Connection]) -> bytes:
         return self.encode_value(
             await self.wrapped_characteristic.read_value(connection)
         )
 
-    async def write_encoded_value(self, connection, value):
+    async def write_encoded_value(
+        self, connection: Optional[Connection], value: bytes
+    ) -> None:
         return await self.wrapped_characteristic.write_value(
             connection, self.decode_value(value)
         )
 
-    async def read_decoded_value(self):
+    async def read_decoded_value(self) -> Tuple[*_TT]:
+        if isinstance(self.wrapped_characteristic, Characteristic):
+            raise AttributeError('Cannot read Characteristic')
         return self.decode_value(await self.wrapped_characteristic.read_value())
 
-    async def write_decoded_value(self, value, with_response=False):
+    async def write_decoded_value(
+        self, *value: *_TT, with_response: bool = False
+    ) -> None:
+        if isinstance(self.wrapped_characteristic, Characteristic):
+            raise AttributeError('Cannot write Characteristic')
         return await self.wrapped_characteristic.write_value(
-            self.encode_value(value), with_response
+            self.encode_value(*value), with_response
         )
 
-    def encode_value(self, value):
-        return value
+    @abc.abstractmethod
+    def encode_value(self, *value: *_TT) -> bytes:
+        ...
 
-    def decode_value(self, value):
-        return value
+    @abc.abstractmethod
+    def decode_value(self, value: bytes) -> Tuple[*_TT]:
+        ...
 
     def wrapped_subscribe(self, subscriber=None):
         if subscriber is not None:
@@ -647,16 +664,26 @@ class DelegatedCharacteristicAdapter(CharacteristicAdapter):
     Adapter that converts bytes values using an encode and a decode function.
     '''
 
-    def __init__(self, characteristic, encode=None, decode=None):
+    encode: Callable[[Tuple[*_TT]], bytes]
+    decode: Callable[[bytes], Tuple[*_TT]]
+
+    def __init__(
+        self,
+        characteristic: Union[Characteristic, AttributeProxy],
+        encode: Optional[Callable[[Tuple[*_TT]], bytes]] = None,
+        decode: Optional[Callable[[bytes], Tuple[*_TT]]] = None,
+    ) -> None:
         super().__init__(characteristic)
-        self.encode = encode
-        self.decode = decode
+        if encode:
+            self.encode = encode  # type: ignore[assignment]
+        if decode:
+            self.decode = decode  # type: ignore[assignment]
 
-    def encode_value(self, value):
-        return self.encode(value) if self.encode else value
+    def encode_value(self, *value: *_TT) -> bytes:
+        return self.encode(value)
 
-    def decode_value(self, value):
-        return self.decode(value) if self.decode else value
+    def decode_value(self, value: bytes) -> Tuple[*_TT]:
+        return self.decode(value)
 
 
 # -----------------------------------------------------------------------------
@@ -670,22 +697,23 @@ class PackedCharacteristicAdapter(CharacteristicAdapter):
     the format.
     '''
 
-    def __init__(self, characteristic, pack_format):
+    def __init__(
+        self, characteristic: Union[Characteristic, AttributeProxy], pack_format: str
+    ) -> None:
         super().__init__(characteristic)
         self.struct = struct.Struct(pack_format)
 
-    def pack(self, *values):
+    def pack(self, *values: *_TT) -> bytes:
         return self.struct.pack(*values)
 
-    def unpack(self, buffer):
+    def unpack(self, buffer: bytes) -> Tuple[*_TT]:
         return self.struct.unpack(buffer)
 
-    def encode_value(self, value):
-        return self.pack(*value if isinstance(value, tuple) else (value,))
+    def encode_value(self, *value: *_TT) -> bytes:
+        return self.pack(*value)
 
-    def decode_value(self, value):
-        unpacked = self.unpack(value)
-        return unpacked[0] if len(unpacked) == 1 else unpacked
+    def decode_value(self, value: bytes) -> Tuple[*_TT]:
+        return self.unpack(value)
 
 
 # -----------------------------------------------------------------------------
@@ -711,7 +739,7 @@ class MappedCharacteristicAdapter(PackedCharacteristicAdapter):
 
 
 # -----------------------------------------------------------------------------
-class UTF8CharacteristicAdapter(CharacteristicAdapter):
+class UTF8CharacteristicAdapter(CharacteristicAdapter[str]):
     '''
     Adapter that converts strings to/from bytes using UTF-8 encoding
     '''
@@ -719,8 +747,8 @@ class UTF8CharacteristicAdapter(CharacteristicAdapter):
     def encode_value(self, value: str) -> bytes:
         return value.encode('utf-8')
 
-    def decode_value(self, value: bytes) -> str:
-        return value.decode('utf-8')
+    def decode_value(self, value: bytes) -> Tuple[str]:
+        return (value.decode('utf-8'),)
 
 
 # -----------------------------------------------------------------------------
