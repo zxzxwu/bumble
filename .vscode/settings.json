@@ -39,6 +39,7 @@
         "Fitbit",
         "GATTLINK",
         "HANDSFREE",
+        "INBAND",
         "keydown",
         "keyup",
         "levelname",
