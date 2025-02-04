@@ -693,7 +693,8 @@ class Host(AbortableEventEmitter):
 
         asyncio.create_task(send_command(command))
 
-    def send_l2cap_pdu(self, connection_handle: int, cid: int, pdu: bytes) -> None:
+    def send_acl_sdu(self, connection_handle: int, sdu: bytes) -> None:
+        '''Sends an Service Data Unit (SDU) packet over ACL, and segment it if needed.'''
         if not (connection := self.connections.get(connection_handle)):
             logger.warning(f'connection 0x{connection_handle:04X} not found')
             return
@@ -704,11 +705,8 @@ class Host(AbortableEventEmitter):
             )
             return
 
-        # Create a PDU
-        l2cap_pdu = bytes(L2CAP_PDU(cid, pdu))
-
         # Send the data to the controller via ACL packets
-        bytes_remaining = len(l2cap_pdu)
+        bytes_remaining = len(sdu)
         offset = 0
         pb_flag = 0
         while bytes_remaining:
@@ -718,9 +716,9 @@ class Host(AbortableEventEmitter):
                 pb_flag=pb_flag,
                 bc_flag=0,
                 data_total_length=data_total_length,
-                data=l2cap_pdu[offset : offset + data_total_length],
+                data=sdu[offset : offset + data_total_length],
             )
-            logger.debug(f'>>> ACL packet enqueue: (CID={cid}) {acl_packet}')
+            logger.debug(f'>>> ACL packet enqueue: {acl_packet}')
             packet_queue.enqueue(acl_packet, connection_handle)
             pb_flag = 1
             offset += data_total_length

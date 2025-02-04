@@ -28,6 +28,7 @@ from bumble.hci import (
     HCI_Write_Loopback_Mode_Command,
     LoopbackMode,
 )
+from bumble import l2cap
 from bumble.host import Host
 from bumble.transport import open_transport_or_link
 import click
@@ -149,8 +150,9 @@ class Loopback:
             bytes_sent = 0
             for cid in range(0, self.packet_count):
                 # using the cid as an incremental index
-                host.send_l2cap_pdu(
-                    self.connection_handle, cid, bytes(self.packet_size)
+                host.send_acl_sdu(
+                    self.connection_handle,
+                    bytes(l2cap.L2CAP_PDU(cid=cid, payload=bytes(self.packet_size))),
                 )
                 print(
                     color(

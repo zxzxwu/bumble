@@ -2412,7 +2412,7 @@ class Device(CompositeEventEmitter):
             raise InvalidArgumentError(f'Unexpected mode {spec}')
 
     def send_l2cap_pdu(self, connection_handle: int, cid: int, pdu: bytes) -> None:
-        self.host.send_l2cap_pdu(connection_handle, cid, pdu)
+        self.host.send_acl_sdu(connection_handle, bytes(l2cap.L2CAP_PDU(cid, pdu)))
 
     async def send_command(self, command, check_result=False):
         try:

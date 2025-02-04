@@ -16,6 +16,7 @@
 # Imports
 # -----------------------------------------------------------------------------
 from __future__ import annotations
+import abc
 import asyncio
 import dataclasses
 import enum
@@ -23,20 +24,22 @@ import logging
 import struct
 
 from collections import deque
-from pyee import EventEmitter
+import pyee
 from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Deque,
     Dict,
-    Type,
+    Iterable,
     List,
     Optional,
-    Tuple,
-    Callable,
-    Any,
-    Union,
-    Deque,
-    Iterable,
+    Self,
     SupportsBytes,
     TYPE_CHECKING,
+    Tuple,
+    Type,
+    Union,
 )
 
 from .utils import deprecated
@@ -166,16 +169,154 @@ L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_INITIAL_CREDITS = 256
 
 L2CAP_MAXIMUM_TRANSMISSION_UNIT_CONFIGURATION_OPTION_TYPE = 0x01
 
-L2CAP_MTU_CONFIGURATION_PARAMETER_TYPE = 0x01
+class ConfigurationParameterType(enum.IntEnum):
+    MTU = 0x01
+    FLUSH_TIMEOUT = 0x02
+    QOS = 0x03
+    RETRANSMISSION_AND_FLOW_CONTROL = 0x04
+    FCS = 0x05
+    EXTENDED_FLOW_SPEC = 0x06
+    EXTENDED_WINDOW_SIZE = 0x07
+
+class TransmissionMode(enum.IntEnum):
+    BASIC = 0x00
+    RETRANSMISSION = 0x01
+    FLOW_CONTROL = 0x02
+    ENHANCED_RETRANSMISSION = 0x03
+    STREAMING = 0x04
+
+class SupervisoryFunction(enum.IntEnum):
+    RR = 0x00 # Receive Ready
+    REJ = 0x01 # Reject
+    RNR = 0x02 # Receive Not Ready
+    SREJ = 0x03 # Select Reject
+
+_CRC_TABLE = [
+    0x0000, 0xc0c1, 0xc181, 0x0140, 0xc301, 0x03c0, 0x0280, 0xc241, 0xc601, 0x06c0, 0x0780,
+    0xc741, 0x0500, 0xc5c1, 0xc481, 0x0440, 0xcc01, 0x0cc0, 0x0d80, 0xcd41, 0x0f00, 0xcfc1,
+    0xce81, 0x0e40, 0x0a00, 0xcac1, 0xcb81, 0x0b40, 0xc901, 0x09c0, 0x0880, 0xc841, 0xd801,
+    0x18c0, 0x1980, 0xd941, 0x1b00, 0xdbc1, 0xda81, 0x1a40, 0x1e00, 0xdec1, 0xdf81, 0x1f40,
+    0xdd01, 0x1dc0, 0x1c80, 0xdc41, 0x1400, 0xd4c1, 0xd581, 0x1540, 0xd701, 0x17c0, 0x1680,
+    0xd641, 0xd201, 0x12c0, 0x1380, 0xd341, 0x1100, 0xd1c1, 0xd081, 0x1040, 0xf001, 0x30c0,
+    0x3180, 0xf141, 0x3300, 0xf3c1, 0xf281, 0x3240, 0x3600, 0xf6c1, 0xf781, 0x3740, 0xf501,
+    0x35c0, 0x3480, 0xf441, 0x3c00, 0xfcc1, 0xfd81, 0x3d40, 0xff01, 0x3fc0, 0x3e80, 0xfe41,
+    0xfa01, 0x3ac0, 0x3b80, 0xfb41, 0x3900, 0xf9c1, 0xf881, 0x3840, 0x2800, 0xe8c1, 0xe981,
+    0x2940, 0xeb01, 0x2bc0, 0x2a80, 0xea41, 0xee01, 0x2ec0, 0x2f80, 0xef41, 0x2d00, 0xedc1,
+    0xec81, 0x2c40, 0xe401, 0x24c0, 0x2580, 0xe541, 0x2700, 0xe7c1, 0xe681, 0x2640, 0x2200,
+    0xe2c1, 0xe381, 0x2340, 0xe101, 0x21c0, 0x2080, 0xe041, 0xa001, 0x60c0, 0x6180, 0xa141,
+    0x6300, 0xa3c1, 0xa281, 0x6240, 0x6600, 0xa6c1, 0xa781, 0x6740, 0xa501, 0x65c0, 0x6480,
+    0xa441, 0x6c00, 0xacc1, 0xad81, 0x6d40, 0xaf01, 0x6fc0, 0x6e80, 0xae41, 0xaa01, 0x6ac0,
+    0x6b80, 0xab41, 0x6900, 0xa9c1, 0xa881, 0x6840, 0x7800, 0xb8c1, 0xb981, 0x7940, 0xbb01,
+    0x7bc0, 0x7a80, 0xba41, 0xbe01, 0x7ec0, 0x7f80, 0xbf41, 0x7d00, 0xbdc1, 0xbc81, 0x7c40,
+    0xb401, 0x74c0, 0x7580, 0xb541, 0x7700, 0xb7c1, 0xb681, 0x7640, 0x7200, 0xb2c1, 0xb381,
+    0x7340, 0xb101, 0x71c0, 0x7080, 0xb041, 0x5000, 0x90c1, 0x9181, 0x5140, 0x9301, 0x53c0,
+    0x5280, 0x9241, 0x9601, 0x56c0, 0x5780, 0x9741, 0x5500, 0x95c1, 0x9481, 0x5440, 0x9c01,
+    0x5cc0, 0x5d80, 0x9d41, 0x5f00, 0x9fc1, 0x9e81, 0x5e40, 0x5a00, 0x9ac1, 0x9b81, 0x5b40,
+    0x9901, 0x59c0, 0x5880, 0x9841, 0x8801, 0x48c0, 0x4980, 0x8941, 0x4b00, 0x8bc1, 0x8a81,
+    0x4a40, 0x4e00, 0x8ec1, 0x8f81, 0x4f40, 0x8d01, 0x4dc0, 0x4c80, 0x8c41, 0x4400, 0x84c1,
+    0x8581, 0x4540, 0x8701, 0x47c0, 0x4680, 0x8641, 0x8201, 0x42c0, 0x4380, 0x8341, 0x4100,
+    0x81c1, 0x8081, 0x4040,
+]
 
 # fmt: on
 # pylint: enable=line-too-long
+
+
+def compute_fcs(buffer: bytes) -> bytes:
+    crc = 0x00
+    for byte in buffer:
+        crc = ((crc >> 8) & 0x00FF) ^ _CRC_TABLE[(crc & 0x00FF) ^ byte]
+    return struct.pack('<H', crc)
 
 
 # -----------------------------------------------------------------------------
 # Classes
 # -----------------------------------------------------------------------------
 # pylint: disable=invalid-name
+
+
+class StandardControlField(abc.ABC):
+
+    class FieldType(enum.IntEnum):
+        I_FRAME = 0x00
+        S_FRAME = 0x01
+
+    class SegmentationAndReassembly(enum.IntEnum):
+        UNSEGMENTED = 0x00
+        START = 0x01
+        END = 0x02
+        CONTINUATION = 0x03
+
+    r: int
+    req_seq: int
+    sar: int
+    frame_type: ClassVar[int]
+
+    @classmethod
+    def from_bytes(cls: type[Self], data: bytes) -> Self:
+        frame_type = data[0] & 0x01
+        if frame_type == cls.FieldType.I_FRAME:
+            return IFrameStandardControlField.from_bytes(data)
+        elif frame_type == cls.FieldType.S_FRAME:
+            return SFrameStandardControlField.from_bytes(data)
+        else:
+            raise InvalidArgumentError(f'Invalid frame type: {frame_type}')
+
+    @abc.abstractmethod
+    def __bytes__(self) -> bytes:
+        raise NotImplementedError()
+
+
+@dataclasses.dataclass(frozen=True)
+class IFrameStandardControlField(StandardControlField):
+    tx_seq: int
+    r: int
+    req_seq: int
+    sar: int
+    frame_type: ClassVar[int] = StandardControlField.FieldType.I_FRAME
+
+    @classmethod
+    def from_bytes(cls: type[Self], data: bytes) -> Self:
+        return cls(
+            tx_seq=(data[0] & 0b01111110) >> 1,
+            r=(data[0] & 0b01111110) >> 1,
+            req_seq=(data[1] & 0b001111111),
+            sar=(data[1] & 0b11000000) >> 6,
+        )
+
+    def __bytes__(self) -> bytes:
+        return bytes(
+            [
+                self.frame_type | (self.tx_seq << 1) | (self.r << 7),
+                self.req_seq | (self.sar << 6),
+            ]
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SFrameStandardControlField(StandardControlField):
+    s: int
+    r: int
+    req_seq: int
+    sar: int = StandardControlField.SegmentationAndReassembly.UNSEGMENTED
+    frame_type: ClassVar[int] = StandardControlField.FieldType.S_FRAME
+
+    @classmethod
+    def from_bytes(cls: type[Self], data: bytes) -> Self:
+        return cls(
+            s=(data[0] & 0b00001100) >> 2,
+            r=(data[0] & 0b10000000) >> 7,
+            req_seq=(data[1] & 0b001111111),
+            sar=(data[1] & 0b11000000) >> 6,
+        )
+
+    def __bytes__(self) -> bytes:
+        return bytes(
+            [
+                self.frame_type | (self.s << 2) | (self.r << 7),
+                self.req_seq | (self.sar << 6),
+            ]
+        )
 
 
 @dataclasses.dataclass
@@ -220,18 +361,24 @@ class L2CAP_PDU:
         if len(data) < 4:
             raise InvalidPacketError('not enough data for L2CAP header')
 
-        _, l2cap_pdu_cid = struct.unpack_from('<HH', data, 0)
-        l2cap_pdu_payload = data[4:]
+        payload_size, l2cap_pdu_cid = struct.unpack_from('<HH', data, 0)
+        l2cap_pdu_payload = data[4 : 4 + payload_size]
 
         return L2CAP_PDU(l2cap_pdu_cid, l2cap_pdu_payload)
 
-    def __bytes__(self) -> bytes:
-        header = struct.pack('<HH', len(self.payload), self.cid)
-        return header + self.payload
-
-    def __init__(self, cid: int, payload: bytes) -> None:
+    def __init__(self, cid: int, payload: bytes, with_fcs: bool = False) -> None:
         self.cid = cid
         self.payload = payload
+        self.with_fcs = with_fcs
+
+    def __bytes__(self) -> bytes:
+        length = len(self.payload) + 2 if self.with_fcs else len(self.payload)
+        header = struct.pack('<HH', length, self.cid)
+        return (
+            header
+            + self.payload
+            + (compute_fcs(self.payload) if self.with_fcs else b'')
+        )
 
     def __str__(self) -> str:
         return f'{color("L2CAP", "green")} [CID={self.cid}]: {self.payload.hex()}'
@@ -720,7 +867,7 @@ class L2CAP_LE_Flow_Control_Credit(L2CAP_Control_Frame):
 
 
 # -----------------------------------------------------------------------------
-class ClassicChannel(EventEmitter):
+class ClassicChannel(pyee.EventEmitter):
     class State(enum.IntEnum):
         # States
         CLOSED = 0x00
@@ -753,6 +900,8 @@ class ClassicChannel(EventEmitter):
     connection: Connection
     mtu: int
     peer_mtu: int
+    peer_mps: int
+    transmission_mode: int
 
     def __init__(
         self,
@@ -773,26 +922,117 @@ class ClassicChannel(EventEmitter):
         self.psm = psm
         self.source_cid = source_cid
         self.destination_cid = 0
+        self.response = None
         self.connection_result = None
         self.disconnection_result = None
         self.sink = None
+        self.peer_mps = 0
+        self.pending_sdu = b''
+        self.transmission_mode = TransmissionMode.BASIC
+        self.tx_window_size = 0
+        self.max_transmit = 0
+        self.retransmission_timeout = 0
+        self.monitor_timeout = 0
+        self.tx_seq = 0
+        self.rx_credits_threshold = 0
+        self.req_seq = 0
+        self.last_acked_seq = 0
 
     def _change_state(self, new_state: State) -> None:
         logger.debug(f'{self} state change -> {color(new_state.name, "cyan")}')
         self.state = new_state
 
-    def send_pdu(self, pdu: Union[SupportsBytes, bytes]) -> None:
-        if self.state != self.State.OPEN:
-            raise InvalidStateError('channel not open')
-        self.manager.send_pdu(self.connection, self.destination_cid, pdu)
+    def send_pdu(
+        self, pdu: Union[SupportsBytes, bytes], with_fcs: bool = False
+    ) -> None:
+        self.manager.send_pdu(self.connection, self.destination_cid, pdu, with_fcs)
 
     def send_control_frame(self, frame: L2CAP_Control_Frame) -> None:
         self.manager.send_control_frame(self.connection, self.signaling_cid, frame)
 
+    def write(self, data: bytes) -> None:
+        if self.transmission_mode == TransmissionMode.ENHANCED_RETRANSMISSION:
+            if len(data) <= self.peer_mps:
+                control = IFrameStandardControlField(
+                    tx_seq=self.tx_seq,
+                    r=0,
+                    req_seq=self.req_seq,
+                    sar=StandardControlField.SegmentationAndReassembly.UNSEGMENTED,
+                )
+                self.send_pdu(bytes(control) + data, with_fcs=True)
+                self.tx_seq = (self.tx_seq + 1) % 64
+            else:
+                offset = 0
+                while offset < len(data):
+                    payload = data[offset : offset + self.peer_mps]
+                    new_offset = offset + len(payload)
+                    if offset == 0:
+                        sar = StandardControlField.SegmentationAndReassembly.START
+                    elif new_offset == len(data):
+                        sar = StandardControlField.SegmentationAndReassembly.END
+                    else:
+                        sar = (
+                            StandardControlField.SegmentationAndReassembly.CONTINUATION
+                        )
+                    offset = new_offset
+                    control = IFrameStandardControlField(
+                        tx_seq=self.tx_seq, r=0, req_seq=self.req_seq, sar=sar
+                    )
+                    self.send_pdu(bytes(control) + payload, with_fcs=True)
+                    self.tx_seq = (self.tx_seq + 1) % 64
+            self.last_acked_seq = self.req_seq
+        else:
+            self.send_pdu(data)
+
+    async def send_request(self, request: SupportsBytes) -> bytes:
+        # Check that there isn't already a request pending
+        if self.response:
+            raise InvalidStateError('request already pending')
+        if self.state != self.State.OPEN:
+            raise InvalidStateError('channel not open')
+
+        self.response = asyncio.get_running_loop().create_future()
+        self.send_pdu(request)
+        return await self.response
+
     def on_pdu(self, pdu: bytes) -> None:
-        if self.sink:
-            # pylint: disable=not-callable
-            self.sink(pdu)
+        if self.response:
+            self.response.set_result(pdu)
+            self.response = None
+        elif self.sink:
+            if self.transmission_mode == TransmissionMode.ENHANCED_RETRANSMISSION:
+                control_field = StandardControlField.from_bytes(pdu[:2])
+                if isinstance(control_field, IFrameStandardControlField):
+                    self.req_seq = control_field.tx_seq + 1
+                    if (
+                        control_field.sar
+                        == StandardControlField.SegmentationAndReassembly.START
+                    ):
+                        # 2 bytes for SDU length.
+                        self.pending_sdu += pdu[4:-2]
+                    if control_field.sar in (
+                        StandardControlField.SegmentationAndReassembly.UNSEGMENTED,
+                        StandardControlField.SegmentationAndReassembly.END,
+                    ):
+                        self.pending_sdu += pdu[2:-2]
+                        # pylint: disable=not-callable
+                        self.sink(self.pending_sdu)
+                        self.pending_sdu = b''
+                    if control_field.tx_seq < self.last_acked_seq:
+                        tx_seq = control_field.tx_seq + 64
+                    else:
+                        tx_seq = control_field.tx_seq
+                    if (tx_seq - self.last_acked_seq) > self.rx_credits_threshold:
+                        control = SFrameStandardControlField(
+                            s=SupervisoryFunction.RR,
+                            r=0,
+                            req_seq=self.req_seq,
+                        )
+                        self.send_pdu(bytes(control), with_fcs=True)
+                        self.last_acked_seq = self.req_seq
+            else:
+                # pylint: disable=not-callable
+                self.sink(pdu)
         else:
             logger.warning(
                 color('received pdu without a pending request or sink', 'red')
@@ -854,11 +1094,28 @@ class ClassicChannel(EventEmitter):
         options = L2CAP_Control_Frame.encode_configuration_options(
             [
                 (
-                    L2CAP_MAXIMUM_TRANSMISSION_UNIT_CONFIGURATION_OPTION_TYPE,
+                    ConfigurationParameterType.MTU,
                     struct.pack('<H', self.mtu),
                 )
             ]
         )
+        if self.transmission_mode == TransmissionMode.ENHANCED_RETRANSMISSION:
+            options += L2CAP_Control_Frame.encode_configuration_options(
+                [
+                    (
+                        ConfigurationParameterType.RETRANSMISSION_AND_FLOW_CONTROL,
+                        struct.pack(
+                            '<BBBHHH',
+                            self.transmission_mode,
+                            self.tx_window_size,
+                            self.max_transmit,
+                            self.retransmission_timeout,
+                            self.monitor_timeout,
+                            self.peer_mps,
+                        ),
+                    )
+                ]
+            )
         self.send_control_frame(
             L2CAP_Configure_Request(
                 identifier=self.manager.next_identifier(self.connection),
@@ -881,8 +1138,6 @@ class ClassicChannel(EventEmitter):
             )
         )
         self._change_state(self.State.WAIT_CONFIG)
-        self.send_configure_request()
-        self._change_state(self.State.WAIT_CONFIG_REQ_RSP)
 
     def on_connection_response(self, response):
         if self.state != self.State.WAIT_CONNECT_RSP:
@@ -919,9 +1174,24 @@ class ClassicChannel(EventEmitter):
         # Decode the options
         options = L2CAP_Control_Frame.decode_configuration_options(request.options)
         for option in options:
-            if option[0] == L2CAP_MTU_CONFIGURATION_PARAMETER_TYPE:
+            if option[0] == ConfigurationParameterType.MTU:
                 self.peer_mtu = struct.unpack('<H', option[1])[0]
                 logger.debug(f'peer MTU = {self.peer_mtu}')
+            elif (
+                option[0] == ConfigurationParameterType.RETRANSMISSION_AND_FLOW_CONTROL
+            ):
+                (
+                    self.transmission_mode,
+                    self.tx_window_size,
+                    self.max_transmit,
+                    self.retransmission_timeout,
+                    self.monitor_timeout,
+                    self.peer_mps,
+                ) = struct.unpack('<BBBHHH', option[1])
+                self.rx_credits_threshold = self.tx_window_size // 2
+                logger.debug(
+                    f'transmission mode = {self.transmission_mode}, peer MPS = {self.peer_mps}'
+                )
 
         self.send_control_frame(
             L2CAP_Configure_Response(
@@ -1026,7 +1296,7 @@ class ClassicChannel(EventEmitter):
 
 
 # -----------------------------------------------------------------------------
-class LeCreditBasedChannel(EventEmitter):
+class LeCreditBasedChannel(pyee.EventEmitter):
     """
     LE Credit-based Connection Oriented Channel
     """
@@ -1381,7 +1651,7 @@ class LeCreditBasedChannel(EventEmitter):
 
 
 # -----------------------------------------------------------------------------
-class ClassicChannelServer(EventEmitter):
+class ClassicChannelServer(pyee.EventEmitter):
     def __init__(
         self,
         manager: ChannelManager,
@@ -1406,7 +1676,7 @@ class ClassicChannelServer(EventEmitter):
 
 
 # -----------------------------------------------------------------------------
-class LeCreditBasedChannelServer(EventEmitter):
+class LeCreditBasedChannelServer(pyee.EventEmitter):
     def __init__(
         self,
         manager: ChannelManager,
@@ -1640,7 +1910,13 @@ class ChannelManager:
         if connection_handle in self.identifiers:
             del self.identifiers[connection_handle]
 
-    def send_pdu(self, connection, cid: int, pdu: Union[SupportsBytes, bytes]) -> None:
+    def send_pdu(
+        self,
+        connection,
+        cid: int,
+        pdu: Union[SupportsBytes, bytes],
+        with_fcs: bool = False,
+    ) -> None:
         pdu_str = pdu.hex() if isinstance(pdu, bytes) else str(pdu)
         pdu_bytes = bytes(pdu)
         logger.debug(
@@ -1648,7 +1924,9 @@ class ChannelManager:
             f'on connection [0x{connection.handle:04X}] (CID={cid}) '
             f'{connection.peer_address}: {len(pdu_bytes)} bytes, {pdu_str}'
         )
-        self.host.send_l2cap_pdu(connection.handle, cid, pdu_bytes)
+        self.host.send_acl_sdu(
+            connection.handle, bytes(L2CAP_PDU(cid=cid, payload=pdu, with_fcs=with_fcs))
+        )
 
     def on_pdu(self, connection: Connection, cid: int, pdu: bytes) -> None:
         if cid in (L2CAP_SIGNALING_CID, L2CAP_LE_SIGNALING_CID):
@@ -1679,7 +1957,7 @@ class ChannelManager:
             f'on connection [0x{connection.handle:04X}] (CID={cid}) '
             f'{connection.peer_address}:\n{control_frame}'
         )
-        self.host.send_l2cap_pdu(connection.handle, cid, bytes(control_frame))
+        self.host.send_acl_sdu(connection.handle, cid, bytes(control_frame))
 
     def on_control_frame(
         self, connection: Connection, cid: int, control_frame: L2CAP_Control_Frame
