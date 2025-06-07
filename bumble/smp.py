@@ -25,15 +25,17 @@
 from __future__ import annotations
 import logging
 import asyncio
+from collections.abc import Sequence
 import enum
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
     Optional,
+    TypeVar,
     cast,
 )
 
@@ -56,6 +58,7 @@ from bumble.core import (
 from bumble.keys import PairingKeys
 from bumble import crypto
 from bumble import utils
+from bumble import hci
 
 if TYPE_CHECKING:
     from bumble.device import Connection, Device
@@ -207,32 +210,29 @@ class SMP_Command:
     '''
 
     smp_classes: dict[int, type[SMP_Command]] = {}
-    fields: Any
-    code = 0
-    name = ''
+    fields: Sequence[tuple[str, hci.FieldSpec]] = ()
+    code: int = 0
+    name: str = ''
+    _pdu: bytes = b''
 
-    @staticmethod
-    def from_bytes(pdu: bytes) -> "SMP_Command":
+    @classmethod
+    def from_bytes(cls, pdu: bytes) -> SMP_Command:
         code = pdu[0]
 
-        cls = SMP_Command.smp_classes.get(code)
-        if cls is None:
+        clazz = SMP_Command.smp_classes.get(code)
+        if clazz is None:
             instance = SMP_Command(pdu)
             instance.name = SMP_Command.command_name(code)
             instance.code = code
             return instance
-        self = cls.__new__(cls)
-        SMP_Command.__init__(self, pdu)
-        if hasattr(self, 'fields'):
-            self.init_from_bytes(pdu, 1)
-        return self
+        return clazz(**HCI_Object.dict_from_bytes(pdu, 1, clazz.fields))
 
-    @staticmethod
-    def command_name(code: int) -> str:
+    @classmethod
+    def command_name(cls, code: int) -> str:
         return name_or_number(SMP_COMMAND_NAMES, code)
 
-    @staticmethod
-    def auth_req_str(value: int) -> str:
+    @classmethod
+    def auth_req_str(cls, value: int) -> str:
         bonding_flags = value & 3
         mitm = (value >> 2) & 1
         sc = (value >> 3) & 1
@@ -244,12 +244,12 @@ class SMP_Command:
             f'MITM={mitm}, sc={sc}, keypress={keypress}, ct2={ct2}'
         )
 
-    @staticmethod
-    def io_capability_name(io_capability: int) -> str:
+    @classmethod
+    def io_capability_name(cls, io_capability: int) -> str:
         return name_or_number(SMP_IO_CAPABILITY_NAMES, io_capability)
 
-    @staticmethod
-    def key_distribution_str(value: int) -> str:
+    @classmethod
+    def key_distribution_str(cls, value: int) -> str:
         key_types: list[str] = []
         if value & SMP_ENC_KEY_DISTRIBUTION_FLAG:
             key_types.append('ENC')
@@ -261,42 +261,36 @@ class SMP_Command:
             key_types.append('LINK')
         return ','.join(key_types)
 
-    @staticmethod
-    def keypress_notification_type_name(notification_type: int) -> str:
+    @classmethod
+    def keypress_notification_type_name(cls, notification_type: int) -> str:
         return name_or_number(SMP_KEYPRESS_NOTIFICATION_TYPE_NAMES, notification_type)
 
-    @staticmethod
-    def subclass(fields):
-        def inner(cls):
-            cls.name = cls.__name__.upper()
-            cls.code = key_with_value(SMP_COMMAND_NAMES, cls.name)
-            if cls.code is None:
-                raise KeyError(
-                    f'Command name {cls.name} not found in SMP_COMMAND_NAMES'
-                )
-            cls.fields = fields
+    _Command = TypeVar('_Command', bound='SMP_Command')
 
-            # Register a factory for this class
-            SMP_Command.smp_classes[cls.code] = cls
+    @classmethod
+    def subclass(cls, clazz: type[_Command]) -> type[_Command]:
+        SMP_Command.smp_classes[clazz.code] = clazz
+        clazz.fields = hci.HCI_Object.fields_from_dataclass(clazz)
+        clazz.name = clazz.__name__.upper()
+        return clazz
 
-            return cls
-
-        return inner
-
-    def __init__(self, pdu: Optional[bytes] = None, **kwargs: Any) -> None:
-        if hasattr(self, 'fields') and kwargs:
+    def __init__(self, pdu: bytes = b'', **kwargs: Any) -> None:
+        if self.fields and kwargs:
             HCI_Object.init_from_fields(self, self.fields, kwargs)
-        if pdu is None:
-            pdu = bytes([self.code]) + HCI_Object.dict_to_bytes(kwargs, self.fields)
-        self.pdu = pdu
+        self._pdu = pdu
 
-    def init_from_bytes(self, pdu: bytes, offset: int) -> None:
-        return HCI_Object.init_from_bytes(self, pdu, offset, self.fields)
+    @property
+    def pdu(self) -> bytes:
+        if not self._pdu:
+            self._pdu = bytes([self.code]) + HCI_Object.dict_to_bytes(
+                self.__dict__, self.fields
+            )
+        return self._pdu
 
-    def __bytes__(self):
+    def __bytes__(self) -> bytes:
         return self.pdu
 
-    def __str__(self):
+    def __str__(self) -> str:
         result = color(self.name, 'yellow')
         if fields := getattr(self, 'fields', None):
             result += ':\n' + HCI_Object.format_fields(self.__dict__, fields, '  ')
@@ -307,206 +301,272 @@ class SMP_Command:
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass(
-    [
-        ('io_capability', {'size': 1, 'mapper': SMP_Command.io_capability_name}),
-        ('oob_data_flag', 1),
-        ('auth_req', {'size': 1, 'mapper': SMP_Command.auth_req_str}),
-        ('maximum_encryption_key_size', 1),
-        (
-            'initiator_key_distribution',
-            {'size': 1, 'mapper': SMP_Command.key_distribution_str},
-        ),
-        (
-            'responder_key_distribution',
-            {'size': 1, 'mapper': SMP_Command.key_distribution_str},
-        ),
-    ]
-)
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Request_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.1 Pairing Request
     '''
 
-    io_capability: int
-    oob_data_flag: int
-    auth_req: int
-    maximum_encryption_key_size: int
-    initiator_key_distribution: int
-    responder_key_distribution: int
+    code = SMP_PAIRING_REQUEST_COMMAND
+
+    io_capability: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.io_capability_name,
+            }
+        )
+    )
+    oob_data_flag: int = field(metadata=hci.metadata(1))
+    auth_req: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.auth_req_str,
+            }
+        )
+    )
+    maximum_encryption_key_size: int = field(metadata=hci.metadata(1))
+    initiator_key_distribution: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.key_distribution_str,
+            }
+        )
+    )
+    responder_key_distribution: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.key_distribution_str,
+            }
+        )
+    )
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass(
-    [
-        ('io_capability', {'size': 1, 'mapper': SMP_Command.io_capability_name}),
-        ('oob_data_flag', 1),
-        ('auth_req', {'size': 1, 'mapper': SMP_Command.auth_req_str}),
-        ('maximum_encryption_key_size', 1),
-        (
-            'initiator_key_distribution',
-            {'size': 1, 'mapper': SMP_Command.key_distribution_str},
-        ),
-        (
-            'responder_key_distribution',
-            {'size': 1, 'mapper': SMP_Command.key_distribution_str},
-        ),
-    ]
-)
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Response_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.2 Pairing Response
     '''
 
-    io_capability: int
-    oob_data_flag: int
-    auth_req: int
-    maximum_encryption_key_size: int
-    initiator_key_distribution: int
-    responder_key_distribution: int
+    code = SMP_PAIRING_RESPONSE_COMMAND
+
+    io_capability: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.io_capability_name,
+            }
+        )
+    )
+    oob_data_flag: int = field(metadata=hci.metadata(1))
+    auth_req: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.auth_req_str,
+            }
+        )
+    )
+    maximum_encryption_key_size: int = field(metadata=hci.metadata(1))
+    initiator_key_distribution: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.key_distribution_str,
+            }
+        )
+    )
+    responder_key_distribution: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.key_distribution_str,
+            }
+        )
+    )
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('confirm_value', 16)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Confirm_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.3 Pairing Confirm
     '''
 
-    confirm_value: bytes
+    code = SMP_PAIRING_CONFIRM_COMMAND
+
+    confirm_value: bytes = field(metadata=hci.metadata(16))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('random_value', 16)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Random_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.4 Pairing Random
     '''
 
-    random_value: bytes
+    code = SMP_PAIRING_RANDOM_COMMAND
+
+    random_value: bytes = field(metadata=hci.metadata(16))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('reason', {'size': 1, 'mapper': error_name})])
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Failed_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.5 Pairing Failed
     '''
 
-    reason: int
+    code = SMP_PAIRING_FAILED_COMMAND
+
+    reason: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': error_name,
+            }
+        )
+    )
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('public_key_x', 32), ('public_key_y', 32)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Public_Key_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.6 Pairing Public Key
     '''
 
-    public_key_x: bytes
-    public_key_y: bytes
+    code = SMP_PAIRING_PUBLIC_KEY_COMMAND
+
+    public_key_x: bytes = field(metadata=hci.metadata(32))
+    public_key_y: bytes = field(metadata=hci.metadata(32))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass(
-    [
-        ('dhkey_check', 16),
-    ]
-)
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_DHKey_Check_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.7 Pairing DHKey Check
     '''
 
-    dhkey_check: bytes
+    code = SMP_PAIRING_DHKEY_CHECK_COMMAND
+
+    dhkey_check: bytes = field(metadata=hci.metadata(16))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass(
-    [
-        (
-            'notification_type',
-            {'size': 1, 'mapper': SMP_Command.keypress_notification_type_name},
-        ),
-    ]
-)
+@SMP_Command.subclass
+@dataclass
 class SMP_Pairing_Keypress_Notification_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.5.8 Keypress Notification
     '''
 
-    notification_type: int
+    code = SMP_PAIRING_KEYPRESS_NOTIFICATION_COMMAND
+
+    notification_type: int = field(
+        metadata=hci.metadata(
+            {
+                'size': 1,
+                'mapper': SMP_Command.keypress_notification_type_name,
+            }
+        )
+    )
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('long_term_key', 16)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Encryption_Information_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.6.2 Encryption Information
     '''
 
-    long_term_key: bytes
+    code = SMP_ENCRYPTION_INFORMATION_COMMAND
+
+    long_term_key: bytes = field(metadata=hci.metadata(16))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('ediv', 2), ('rand', 8)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Master_Identification_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.6.3 Master Identification
     '''
 
-    ediv: int
-    rand: bytes
+    code = SMP_MASTER_IDENTIFICATION_COMMAND
+
+    ediv: int = field(metadata=hci.metadata(2))
+    rand: bytes = field(metadata=hci.metadata(8))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('identity_resolving_key', 16)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Identity_Information_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.6.4 Identity Information
     '''
 
-    identity_resolving_key: bytes
+    code = SMP_IDENTITY_INFORMATION_COMMAND
+
+    identity_resolving_key: bytes = field(metadata=hci.metadata(16))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass(
-    [
-        ('addr_type', Address.ADDRESS_TYPE_SPEC),
-        ('bd_addr', Address.parse_address_preceded_by_type),
-    ]
-)
+@SMP_Command.subclass
+@dataclass
 class SMP_Identity_Address_Information_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.6.5 Identity Address Information
     '''
 
-    addr_type: int
-    bd_addr: Address
+    code = SMP_IDENTITY_ADDRESS_INFORMATION_COMMAND
+
+    addr_type: int = field(metadata=hci.metadata(Address.ADDRESS_TYPE_SPEC))
+    bd_addr: Address = field(
+        metadata=hci.metadata(Address.parse_address_preceded_by_type)
+    )
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass([('signature_key', 16)])
+@SMP_Command.subclass
+@dataclass
 class SMP_Signing_Information_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.6.6 Signing Information
     '''
 
-    signature_key: bytes
+    code = SMP_SIGNING_INFORMATION_COMMAND
+
+    signature_key: bytes = field(metadata=hci.metadata(16))
 
 
 # -----------------------------------------------------------------------------
-@SMP_Command.subclass(
-    [
-        ('auth_req', {'size': 1, 'mapper': SMP_Command.auth_req_str}),
-    ]
-)
+@SMP_Command.subclass
+@dataclass
 class SMP_Security_Request_Command(SMP_Command):
     '''
     See Bluetooth spec @ Vol 3, Part H - 3.6.7 Security Request
     '''
 
-    auth_req: int
+    code = SMP_SECURITY_REQUEST_COMMAND
+
+    auth_req: int = field(
+        metadata=hci.metadata({'size': 1, 'mapper': SMP_Command.auth_req_str})
+    )
 
 
 # -----------------------------------------------------------------------------
