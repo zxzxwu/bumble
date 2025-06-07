@@ -17,12 +17,22 @@
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 import asyncio
+from dataclasses import dataclass, field
 import logging
 import struct
-from typing import Iterable, NewType, Optional, Union, Sequence, TYPE_CHECKING
+from typing import (
+    Callable,
+    Iterable,
+    NewType,
+    Optional,
+    Union,
+    Sequence,
+    TypeVar,
+    TYPE_CHECKING,
+)
 from typing_extensions import Self
 
-from bumble import core, l2cap
+from bumble import core, l2cap, hci
 from bumble.colors import color
 from bumble.core import (
     InvalidStateError,
@@ -30,7 +40,6 @@ from bumble.core import (
     InvalidPacketError,
     ProtocolError,
 )
-from bumble.hci import HCI_Object, name_or_number, key_with_value
 
 if TYPE_CHECKING:
     from bumble.device import Device, Connection
@@ -161,7 +170,7 @@ class DataElement:
         URL: 'URL',
     }
 
-    type_constructors = {
+    type_constructors: dict[int, Callable[..., DataElement]] = {
         NIL: lambda x: DataElement(DataElement.NIL, None),
         UNSIGNED_INTEGER: lambda x, y: DataElement(
             DataElement.UNSIGNED_INTEGER,
@@ -291,8 +300,8 @@ class DataElement:
 
         raise InvalidPacketError(f'invalid integer length {len(data)}')
 
-    @staticmethod
-    def list_from_bytes(data):
+    @classmethod
+    def list_from_bytes(cls, data: bytes) -> list[DataElement]:
         elements = []
         while data:
             element = DataElement.from_bytes(data)
@@ -300,13 +309,13 @@ class DataElement:
             data = data[len(bytes(element)) :]
         return elements
 
-    @staticmethod
-    def parse_from_bytes(data, offset):
+    @classmethod
+    def parse_from_bytes(cls, data: bytes, offset: int) -> tuple[int, DataElement]:
         element = DataElement.from_bytes(data[offset:])
         return offset + len(bytes(element)), element
 
-    @staticmethod
-    def from_bytes(data):
+    @classmethod
+    def from_bytes(cls, data: bytes) -> DataElement:
         element_type = data[0] >> 3
         size_index = data[0] & 7
         value_offset = 0
@@ -350,7 +359,7 @@ class DataElement:
         ]  # Keep a copy so we can re-serialize to an exact replica
         return result
 
-    def __bytes__(self):
+    def __bytes__(self) -> bytes:
         # Return early if we have a cache
         if self.bytes:
             return self.bytes
@@ -443,9 +452,9 @@ class DataElement:
         self.bytes = bytes([self.type << 3 | size_index]) + size_bytes + data
         return self.bytes
 
-    def to_string(self, pretty=False, indentation=0):
+    def to_string(self, pretty: bool = False, indentation: int = 0) -> str:
         prefix = '  ' * indentation
-        type_name = name_or_number(self.TYPE_NAMES, self.type)
+        type_name = hci.name_or_number(self.TYPE_NAMES, self.type)
         if self.type == DataElement.NIL:
             value_string = ''
         elif self.type in (DataElement.SEQUENCE, DataElement.ALTERNATIVE):
@@ -468,7 +477,7 @@ class DataElement:
             value_string = str(self.value)
         return f'{prefix}{type_name}({value_string})'
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.to_string()
 
 
@@ -506,8 +515,8 @@ class ServiceAttribute:
         )
 
     @staticmethod
-    def id_name(id_code):
-        return name_or_number(SDP_ATTRIBUTE_ID_NAMES, id_code)
+    def id_name(id_code: int) -> str:
+        return hci.name_or_number(SDP_ATTRIBUTE_ID_NAMES, id_code)
 
     @staticmethod
     def is_uuid_in_value(uuid: core.UUID, value: DataElement) -> bool:
@@ -523,7 +532,7 @@ class ServiceAttribute:
 
         return False
 
-    def to_string(self, with_colors=False):
+    def to_string(self, with_colors: bool = False) -> str:
         if with_colors:
             return (
                 f'Attribute(id={color(self.id_name(self.id),"magenta")},'
@@ -532,7 +541,7 @@ class ServiceAttribute:
 
         return f'Attribute(id={self.id_name(self.id)},value={self.value})'
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.to_string()
 
 
@@ -548,29 +557,31 @@ class SDP_PDU:
         SDP_SERVICE_SEARCH_ATTRIBUTE_REQUEST: SDP_SERVICE_SEARCH_ATTRIBUTE_RESPONSE,
     }
     sdp_pdu_classes: dict[int, type[SDP_PDU]] = {}
-    name = None
-    pdu_id = 0
+    name: str = ''
+    pdu_id: int = 0
+    fields: Sequence[tuple[str, hci.FieldSpec]] = ()
+    transaction_id: int
+    _pdu: bytes = b''
 
-    @staticmethod
-    def from_bytes(pdu):
+    @classmethod
+    def from_bytes(cls, pdu: bytes) -> SDP_PDU:
         pdu_id, transaction_id, _parameters_length = struct.unpack_from('>BHH', pdu, 0)
 
-        cls = SDP_PDU.sdp_pdu_classes.get(pdu_id)
-        if cls is None:
+        clazz = SDP_PDU.sdp_pdu_classes.get(pdu_id)
+        if clazz is None:
             instance = SDP_PDU(pdu)
             instance.name = SDP_PDU.pdu_name(pdu_id)
             instance.pdu_id = pdu_id
             instance.transaction_id = transaction_id
             return instance
-        self = cls.__new__(cls)
-        SDP_PDU.__init__(self, pdu, transaction_id)
-        if hasattr(self, 'fields'):
-            self.init_from_bytes(pdu, 5)
-        return self
+        return clazz(
+            transaction_id=transaction_id,
+            **hci.HCI_Object.dict_from_bytes(pdu, offset=5, fields=clazz.fields),
+        )
 
-    @staticmethod
+    @classmethod
     def parse_service_record_handle_list_preceded_by_count(
-        data: bytes, offset: int
+        cls, data: bytes, offset: int
     ) -> tuple[int, list[int]]:
         count = struct.unpack_from('>H', data, offset - 2)[0]
         handle_list = [
@@ -578,198 +589,202 @@ class SDP_PDU:
         ]
         return offset + count * 4, handle_list
 
-    @staticmethod
-    def parse_bytes_preceded_by_length(data, offset):
+    @classmethod
+    def parse_bytes_preceded_by_length(
+        cls, data: bytes, offset: int
+    ) -> tuple[int, bytes]:
         length = struct.unpack_from('>H', data, offset - 2)[0]
         return offset + length, data[offset : offset + length]
 
-    @staticmethod
-    def error_name(error_code):
-        return name_or_number(SDP_ERROR_NAMES, error_code)
+    @classmethod
+    def error_name(cls, error_code: int) -> str:
+        return hci.name_or_number(SDP_ERROR_NAMES, error_code)
 
-    @staticmethod
-    def pdu_name(code):
-        return name_or_number(SDP_PDU_NAMES, code)
+    @classmethod
+    def pdu_name(cls, code: int) -> str:
+        return hci.name_or_number(SDP_PDU_NAMES, code)
 
-    @staticmethod
-    def subclass(fields):
-        def inner(cls):
-            name = cls.__name__
+    _PDU = TypeVar('_PDU', bound='SDP_PDU')
 
-            # add a _ character before every uppercase letter, except the SDP_ prefix
-            location = len(name) - 1
-            while location > 4:
-                if not name[location].isupper():
-                    location -= 1
-                    continue
-                name = name[:location] + '_' + name[location:]
-                location -= 1
+    @classmethod
+    def subclass(cls, clazz: type[_PDU]) -> type[_PDU]:
+        # Register a factory for this class
+        SDP_PDU.sdp_pdu_classes[clazz.pdu_id] = clazz
+        clazz.fields = hci.HCI_Object.fields_from_dataclass(clazz)
+        return clazz
 
-            cls.name = name.upper()
-            cls.pdu_id = key_with_value(SDP_PDU_NAMES, cls.name)
-            if cls.pdu_id is None:
-                raise KeyError(f'PDU name {cls.name} not found in SDP_PDU_NAMES')
-            cls.fields = fields
-
-            # Register a factory for this class
-            SDP_PDU.sdp_pdu_classes[cls.pdu_id] = cls
-
-            return cls
-
-        return inner
-
-    def __init__(self, pdu=None, transaction_id=0, **kwargs):
-        if hasattr(self, 'fields') and kwargs:
-            HCI_Object.init_from_fields(self, self.fields, kwargs)
+    def __init__(
+        self, pdu: bytes | None = None, transaction_id: int = 0, **kwargs
+    ) -> None:
+        if self.fields and kwargs:
+            hci.HCI_Object.init_from_fields(self, self.fields, kwargs)
         if pdu is None:
-            parameters = HCI_Object.dict_to_bytes(kwargs, self.fields)
+            parameters = hci.HCI_Object.dict_to_bytes(kwargs, self.fields)
             pdu = (
                 struct.pack('>BHH', self.pdu_id, transaction_id, len(parameters))
                 + parameters
             )
-        self.pdu = pdu
+        self._pdu = pdu
         self.transaction_id = transaction_id
 
-    def init_from_bytes(self, pdu, offset):
-        return HCI_Object.init_from_bytes(self, pdu, offset, self.fields)
+    @property
+    def pdu(self) -> bytes:
+        if not self._pdu:
+            parameters = hci.HCI_Object.dict_to_bytes(self.__dict__, self.fields)
+            self._pdu = (
+                struct.pack('>BHH', self.pdu_id, self.transaction_id, len(parameters))
+                + parameters
+            )
+        return self._pdu
 
-    def __bytes__(self):
+    def __bytes__(self) -> bytes:
         return self.pdu
 
-    def __str__(self):
+    def __str__(self) -> str:
         result = f'{color(self.name, "blue")} [TID={self.transaction_id}]'
         if fields := getattr(self, 'fields', None):
-            result += ':\n' + HCI_Object.format_fields(self.__dict__, fields, '  ')
+            result += ':\n' + hci.HCI_Object.format_fields(self.__dict__, fields, '  ')
         elif len(self.pdu) > 1:
             result += f': {self.pdu.hex()}'
         return result
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass([('error_code', {'size': 2, 'mapper': SDP_PDU.error_name})])
+@SDP_PDU.subclass
+@dataclass
 class SDP_ErrorResponse(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.4.1 SDP_ErrorResponse PDU
     '''
 
-    error_code: int
+    pdu_id = SDP_ERROR_RESPONSE
+    name = 'SDP_ERROR_RESPONSE'
+
+    transaction_id: int
+    error_code: int = field(
+        metadata=hci.metadata({'size': 2, 'mapper': SDP_PDU.error_name})
+    )
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass(
-    [
-        ('service_search_pattern', DataElement.parse_from_bytes),
-        ('maximum_service_record_count', '>2'),
-        ('continuation_state', '*'),
-    ]
-)
+@SDP_PDU.subclass
+@dataclass
 class SDP_ServiceSearchRequest(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.5.1 SDP_ServiceSearchRequest PDU
     '''
 
-    service_search_pattern: DataElement
-    maximum_service_record_count: int
-    continuation_state: bytes
+    pdu_id = SDP_SERVICE_SEARCH_REQUEST
+    name = 'SDP_SERVICE_SEARCH_REQUEST'
+
+    transaction_id: int
+    service_search_pattern: DataElement = field(
+        metadata=hci.metadata(DataElement.parse_from_bytes)
+    )
+    maximum_service_record_count: int = field(metadata=hci.metadata('>2'))
+    continuation_state: bytes = field(metadata=hci.metadata('*'))
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass(
-    [
-        ('total_service_record_count', '>2'),
-        ('current_service_record_count', '>2'),
-        (
-            'service_record_handle_list',
-            SDP_PDU.parse_service_record_handle_list_preceded_by_count,
-        ),
-        ('continuation_state', '*'),
-    ]
-)
+@SDP_PDU.subclass
+@dataclass
 class SDP_ServiceSearchResponse(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.5.2 SDP_ServiceSearchResponse PDU
     '''
 
-    service_record_handle_list: list[int]
-    total_service_record_count: int
-    current_service_record_count: int
-    continuation_state: bytes
+    pdu_id = SDP_SERVICE_SEARCH_RESPONSE
+    name = 'SDP_SERVICE_SEARCH_RESPONSE'
+
+    transaction_id: int
+    total_service_record_count: int = field(metadata=hci.metadata('>2'))
+    current_service_record_count: int = field(metadata=hci.metadata('>2'))
+    service_record_handle_list: Sequence[int] = field(
+        metadata=hci.metadata(
+            SDP_PDU.parse_service_record_handle_list_preceded_by_count
+        )
+    )
+    continuation_state: bytes = field(metadata=hci.metadata('*'))
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass(
-    [
-        ('service_record_handle', '>4'),
-        ('maximum_attribute_byte_count', '>2'),
-        ('attribute_id_list', DataElement.parse_from_bytes),
-        ('continuation_state', '*'),
-    ]
-)
+@SDP_PDU.subclass
+@dataclass
 class SDP_ServiceAttributeRequest(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.6.1 SDP_ServiceAttributeRequest PDU
     '''
 
-    service_record_handle: int
-    maximum_attribute_byte_count: int
-    attribute_id_list: DataElement
-    continuation_state: bytes
+    pdu_id = SDP_SERVICE_ATTRIBUTE_REQUEST
+    name = 'SDP_SERVICE_ATTRIBUTE_REQUEST'
+
+    transaction_id: int
+    service_record_handle: int = field(metadata=hci.metadata('>4'))
+    maximum_attribute_byte_count: int = field(metadata=hci.metadata('>2'))
+    attribute_id_list: DataElement = field(
+        metadata=hci.metadata(DataElement.parse_from_bytes)
+    )
+    continuation_state: bytes = field(metadata=hci.metadata('*'))
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass(
-    [
-        ('attribute_list_byte_count', '>2'),
-        ('attribute_list', SDP_PDU.parse_bytes_preceded_by_length),
-        ('continuation_state', '*'),
-    ]
-)
+@SDP_PDU.subclass
+@dataclass
 class SDP_ServiceAttributeResponse(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.6.2 SDP_ServiceAttributeResponse PDU
     '''
 
-    attribute_list_byte_count: int
-    attribute_list: bytes
-    continuation_state: bytes
+    pdu_id = SDP_SERVICE_ATTRIBUTE_RESPONSE
+    name = 'SDP_SERVICE_ATTRIBUTE_RESPONSE'
+
+    transaction_id: int
+    attribute_list_byte_count: int = field(metadata=hci.metadata('>2'))
+    attribute_list: bytes = field(
+        metadata=hci.metadata(SDP_PDU.parse_bytes_preceded_by_length)
+    )
+    continuation_state: bytes = field(metadata=hci.metadata('*'))
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass(
-    [
-        ('service_search_pattern', DataElement.parse_from_bytes),
-        ('maximum_attribute_byte_count', '>2'),
-        ('attribute_id_list', DataElement.parse_from_bytes),
-        ('continuation_state', '*'),
-    ]
-)
+@SDP_PDU.subclass
+@dataclass
 class SDP_ServiceSearchAttributeRequest(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.7.1 SDP_ServiceSearchAttributeRequest PDU
     '''
 
-    service_search_pattern: DataElement
-    maximum_attribute_byte_count: int
-    attribute_id_list: DataElement
-    continuation_state: bytes
+    pdu_id = SDP_SERVICE_SEARCH_ATTRIBUTE_REQUEST
+    name = 'SDP_SERVICE_SEARCH_ATTRIBUTE_REQUEST'
+
+    transaction_id: int
+    service_search_pattern: DataElement = field(
+        metadata=hci.metadata(DataElement.parse_from_bytes)
+    )
+    maximum_attribute_byte_count: int = field(metadata=hci.metadata('>2'))
+    attribute_id_list: DataElement = field(
+        metadata=hci.metadata(DataElement.parse_from_bytes)
+    )
+    continuation_state: bytes = field(metadata=hci.metadata('*'))
 
 
 # -----------------------------------------------------------------------------
-@SDP_PDU.subclass(
-    [
-        ('attribute_lists_byte_count', '>2'),
-        ('attribute_lists', SDP_PDU.parse_bytes_preceded_by_length),
-        ('continuation_state', '*'),
-    ]
-)
+@SDP_PDU.subclass
+@dataclass
 class SDP_ServiceSearchAttributeResponse(SDP_PDU):
     '''
     See Bluetooth spec @ Vol 3, Part B - 4.7.2 SDP_ServiceSearchAttributeResponse PDU
     '''
 
-    attribute_lists_byte_count: int
-    attribute_lists: bytes
-    continuation_state: bytes
+    pdu_id = SDP_SERVICE_SEARCH_ATTRIBUTE_RESPONSE
+    name = 'SDP_SERVICE_SEARCH_ATTRIBUTE_RESPONSE'
+
+    transaction_id: int
+    attribute_lists_byte_count: int = field(metadata=hci.metadata('>2'))
+    attribute_lists: bytes = field(
+        metadata=hci.metadata(SDP_PDU.parse_bytes_preceded_by_length)
+    )
+    continuation_state: bytes = field(metadata=hci.metadata('*'))
 
 
 # -----------------------------------------------------------------------------
@@ -870,7 +885,7 @@ class Client:
         )
 
         # Request and accumulate until there's no more continuation
-        service_record_handle_list = []
+        service_record_handle_list: list[int] = []
         continuation_state = bytes([0])
         watchdog = SDP_CONTINUATION_WATCHDOG
         while watchdog > 0:
@@ -1077,11 +1092,11 @@ class Server:
 
         return matching_services
 
-    def on_connection(self, channel):
+    def on_connection(self, channel: l2cap.ClassicChannel) -> None:
         self.channel = channel
         self.channel.sink = self.on_pdu
 
-    def on_pdu(self, pdu):
+    def on_pdu(self, pdu: bytes) -> None:
         try:
             sdp_pdu = SDP_PDU.from_bytes(pdu)
         except Exception as error:
