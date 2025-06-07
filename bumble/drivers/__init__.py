@@ -45,7 +45,7 @@ async def get_driver_for_host(host: Host) -> Optional[Driver]:
     found.
     If a "driver" HCI metadata entry is present, only that driver class will be probed.
     """
-    driver_classes: Dict[str, Type[Driver]] = {"rtk": rtk.Driver, "intel": intel.Driver}
+    driver_classes: dict[str, type[Driver]] = {"rtk": rtk.Driver, "intel": intel.Driver}
     probe_list: Iterable[str]
     if driver_name := host.hci_metadata.get("driver"):
         # Only probe a single driver

@@ -26,14 +26,9 @@ import enum
 import traceback
 import re
 from typing import (
-    Dict,
-    List,
     Union,
-    Set,
     Any,
     Optional,
-    Type,
-    Tuple,
     ClassVar,
     Iterable,
     TYPE_CHECKING,
@@ -375,7 +370,7 @@ class CallLineIdentification:
     cli_validity: Optional[int] = None
 
     @classmethod
-    def parse_from(cls: Type[Self], parameters: List[bytes]) -> Self:
+    def parse_from(cls, parameters: list[bytes]) -> Self:
         return cls(
             number=parameters[0].decode(),
             type=int(parameters[1]),
@@ -505,9 +500,9 @@ STATUS_CODES = {
 
 @dataclasses.dataclass
 class HfConfiguration:
-    supported_hf_features: List[HfFeature]
-    supported_hf_indicators: List[HfIndicator]
-    supported_audio_codecs: List[AudioCodec]
+    supported_hf_features: list[HfFeature]
+    supported_hf_indicators: list[HfIndicator]
+    supported_audio_codecs: list[AudioCodec]
 
 
 @dataclasses.dataclass
@@ -535,7 +530,7 @@ class AtResponse:
     parameters: list
 
     @classmethod
-    def parse_from(cls: Type[Self], buffer: bytearray) -> Self:
+    def parse_from(cls: type[Self], buffer: bytearray) -> Self:
         code_and_parameters = buffer.split(b':')
         parameters = (
             code_and_parameters[1] if len(code_and_parameters) > 1 else bytearray()
@@ -563,7 +558,7 @@ class AtCommand:
     )
 
     @classmethod
-    def parse_from(cls: Type[Self], buffer: bytearray) -> Self:
+    def parse_from(cls: type[Self], buffer: bytearray) -> Self:
         if not (match := cls._PARSE_PATTERN.fullmatch(buffer.decode())):
             if buffer.startswith(b'ATA'):
                 return cls(code='A', sub_code=AtCommand.SubCode.NONE, parameters=[])
@@ -598,7 +593,7 @@ class AgIndicatorState:
     """
 
     indicator: AgIndicator
-    supported_values: Set[int]
+    supported_values: set[int]
     current_status: int
     index: Optional[int] = None
     enabled: bool = True
@@ -616,14 +611,14 @@ class AgIndicatorState:
         return f'(\"{self.indicator.value}\",{supported_values_text})'
 
     @classmethod
-    def call(cls: Type[Self]) -> Self:
+    def call(cls: type[Self]) -> Self:
         """Default call indicator state."""
         return cls(
             indicator=AgIndicator.CALL, supported_values={0, 1}, current_status=0
         )
 
     @classmethod
-    def callsetup(cls: Type[Self]) -> Self:
+    def callsetup(cls: type[Self]) -> Self:
         """Default callsetup indicator state."""
         return cls(
             indicator=AgIndicator.CALL_SETUP,
@@ -632,7 +627,7 @@ class AgIndicatorState:
         )
 
     @classmethod
-    def callheld(cls: Type[Self]) -> Self:
+    def callheld(cls: type[Self]) -> Self:
         """Default call indicator state."""
         return cls(
             indicator=AgIndicator.CALL_HELD,
@@ -641,14 +636,14 @@ class AgIndicatorState:
         )
 
     @classmethod
-    def service(cls: Type[Self]) -> Self:
+    def service(cls: type[Self]) -> Self:
         """Default service indicator state."""
         return cls(
             indicator=AgIndicator.SERVICE, supported_values={0, 1}, current_status=0
         )
 
     @classmethod
-    def signal(cls: Type[Self]) -> Self:
+    def signal(cls: type[Self]) -> Self:
         """Default signal indicator state."""
         return cls(
             indicator=AgIndicator.SIGNAL,
@@ -657,14 +652,14 @@ class AgIndicatorState:
         )
 
     @classmethod
-    def roam(cls: Type[Self]) -> Self:
+    def roam(cls: type[Self]) -> Self:
         """Default roam indicator state."""
         return cls(
             indicator=AgIndicator.CALL, supported_values={0, 1}, current_status=0
         )
 
     @classmethod
-    def battchg(cls: Type[Self]) -> Self:
+    def battchg(cls: type[Self]) -> Self:
         """Default battery charge indicator state."""
         return cls(
             indicator=AgIndicator.BATTERY_CHARGE,
@@ -732,22 +727,18 @@ class HfProtocol(utils.EventEmitter):
         """Termination signal for run() loop."""
 
     supported_hf_features: int
-    supported_audio_codecs: List[AudioCodec]
+    supported_audio_codecs: list[AudioCodec]
 
     supported_ag_features: int
-    supported_ag_call_hold_operations: List[CallHoldOperation]
+    supported_ag_call_hold_operations: list[CallHoldOperation]
 
-    ag_indicators: List[AgIndicatorState]
-    hf_indicators: Dict[HfIndicator, HfIndicatorState]
+    ag_indicators: list[AgIndicatorState]
+    hf_indicators: dict[HfIndicator, HfIndicatorState]
 
     dlc: rfcomm.DLC
     command_lock: asyncio.Lock
-    if TYPE_CHECKING:
-        response_queue: asyncio.Queue[AtResponse]
-        unsolicited_queue: asyncio.Queue[Optional[AtResponse]]
-    else:
-        response_queue: asyncio.Queue
-        unsolicited_queue: asyncio.Queue
+    response_queue: asyncio.Queue[AtResponse]
+    unsolicited_queue: asyncio.Queue[Optional[AtResponse]]
     read_buffer: bytearray
     active_codec: AudioCodec
 
@@ -836,7 +827,7 @@ class HfProtocol(utils.EventEmitter):
         cmd: str,
         timeout: float = 1.0,
         response_type: AtResponseType = AtResponseType.NONE,
-    ) -> Union[None, AtResponse, List[AtResponse]]:
+    ) -> Union[None, AtResponse, list[AtResponse]]:
         """
         Sends an AT command and wait for the peer response.
         Wait for the AT responses sent by the peer, to the status code.
@@ -853,7 +844,7 @@ class HfProtocol(utils.EventEmitter):
         async with self.command_lock:
             logger.debug(f">>> {cmd}")
             self.dlc.write(cmd + '\r')
-            responses: List[AtResponse] = []
+            responses: list[AtResponse] = []
 
             while True:
                 result = await asyncio.wait_for(
@@ -1073,7 +1064,7 @@ class HfProtocol(utils.EventEmitter):
         # code, with the value indicating (call=0).
         await self.execute_command("AT+CHUP")
 
-    async def query_current_calls(self) -> List[CallInfo]:
+    async def query_current_calls(self) -> list[CallInfo]:
         """4.32.1 Query List of Current Calls in AG.
 
         Return:
@@ -1204,27 +1195,27 @@ class AgProtocol(utils.EventEmitter):
     EVENT_MICROPHONE_VOLUME = "microphone_volume"
 
     supported_hf_features: int
-    supported_hf_indicators: Set[HfIndicator]
-    supported_audio_codecs: List[AudioCodec]
+    supported_hf_indicators: set[HfIndicator]
+    supported_audio_codecs: list[AudioCodec]
 
     supported_ag_features: int
-    supported_ag_call_hold_operations: List[CallHoldOperation]
+    supported_ag_call_hold_operations: list[CallHoldOperation]
 
-    ag_indicators: List[AgIndicatorState]
+    ag_indicators: list[AgIndicatorState]
     hf_indicators: collections.OrderedDict[HfIndicator, HfIndicatorState]
 
     dlc: rfcomm.DLC
 
     read_buffer: bytearray
     active_codec: AudioCodec
-    calls: List[CallInfo]
+    calls: list[CallInfo]
 
     indicator_report_enabled: bool
     inband_ringtone_enabled: bool
     cme_error_enabled: bool
     cli_notification_enabled: bool
     call_waiting_enabled: bool
-    _remained_slc_setup_features: Set[HfFeature]
+    _remained_slc_setup_features: set[HfFeature]
 
     def __init__(self, dlc: rfcomm.DLC, configuration: AgConfiguration) -> None:
         super().__init__()
@@ -1694,7 +1685,7 @@ def make_hf_sdp_records(
     rfcomm_channel: int,
     configuration: HfConfiguration,
     version: ProfileVersion = ProfileVersion.V1_8,
-) -> List[sdp.ServiceAttribute]:
+) -> list[sdp.ServiceAttribute]:
     """
     Generates the SDP record for HFP Hands-Free support.
 
@@ -1780,7 +1771,7 @@ def make_ag_sdp_records(
     rfcomm_channel: int,
     configuration: AgConfiguration,
     version: ProfileVersion = ProfileVersion.V1_8,
-) -> List[sdp.ServiceAttribute]:
+) -> list[sdp.ServiceAttribute]:
     """
     Generates the SDP record for HFP Audio-Gateway support.
 
@@ -1860,7 +1851,7 @@ def make_ag_sdp_records(
 
 async def find_hf_sdp_record(
     connection: device.Connection,
-) -> Optional[Tuple[int, ProfileVersion, HfSdpFeature]]:
+) -> Optional[tuple[int, ProfileVersion, HfSdpFeature]]:
     """Searches a Hands-Free SDP record from remote device.
 
     Args:
@@ -1912,7 +1903,7 @@ async def find_hf_sdp_record(
 
 async def find_ag_sdp_record(
     connection: device.Connection,
-) -> Optional[Tuple[int, ProfileVersion, AgSdpFeature]]:
+) -> Optional[tuple[int, ProfileVersion, AgSdpFeature]]:
     """Searches an Audio-Gateway SDP record from remote device.
 
     Args:
@@ -2010,7 +2001,7 @@ class EscoParameters:
     transmit_codec_frame_size: int = 60
     receive_codec_frame_size: int = 60
 
-    def asdict(self) -> Dict[str, Any]:
+    def asdict(self) -> dict[str, Any]:
         # dataclasses.asdict() will recursively deep-copy the entire object,
         # which is expensive and breaks CodingFormat object, so let it simply copy here.
         return self.__dict__

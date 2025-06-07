@@ -18,7 +18,7 @@
 from __future__ import annotations
 import enum
 import struct
-from typing import Dict, Type, Union, Tuple
+from typing import Union, Tuple
 
 from bumble import core
 from bumble import utils
@@ -213,7 +213,7 @@ class CommandFrame(Frame):
         NOTIFY = 0x03
         GENERAL_INQUIRY = 0x04
 
-    subclasses: Dict[Frame.OperationCode, Type[CommandFrame]] = {}
+    subclasses: dict[Frame.OperationCode, type[CommandFrame]] = {}
     ctype: CommandType
 
     @staticmethod
@@ -251,7 +251,7 @@ class ResponseFrame(Frame):
         CHANGED = 0x0D
         INTERIM = 0x0F
 
-    subclasses: Dict[Frame.OperationCode, Type[ResponseFrame]] = {}
+    subclasses: dict[Frame.OperationCode, type[ResponseFrame]] = {}
     response: ResponseCode
 
     @staticmethod
