@@ -344,9 +344,7 @@ class AseStateMachine(gatt.Characteristic):
             and cis_link.cis_id == self.cis_id
             and self.state == self.State.ENABLING
         ):
-            utils.cancel_on_event(
-                cis_link.acl_connection,
-                'flush',
+            cis_link.acl_connection.cancel_on_disconnection(
                 self.service.device.accept_cis_request(cis_link),
             )
 
@@ -358,14 +356,13 @@ class AseStateMachine(gatt.Characteristic):
         ):
             cis_link.on(cis_link.EVENT_DISCONNECTION, self.on_cis_disconnection)
 
-            async def post_cis_established():
-                await cis_link.setup_data_path(direction=self.role)
+            async def post_cis_established() -> None:
+                await cis_link.setup_data_path(direction=cis_link.Direction(self.role))
                 if self.role == AudioRole.SINK:
                     self.state = self.State.STREAMING
-                await self.service.device.notify_subscribers(self, self.value)
 
             utils.cancel_on_event(
-                cis_link.acl_connection, 'flush', post_cis_established()
+                cis_link, cis_link.EVENT_DISCONNECTION, post_cis_established()
             )
             self.cis_link = cis_link
 
@@ -516,15 +513,16 @@ class AseStateMachine(gatt.Characteristic):
                 AseResponseCode.INVALID_ASE_STATE_MACHINE_TRANSITION,
                 AseReasonCode.NONE,
             )
+        # Must enter RELEASING first before IDLE. This will trigger a notification.
         self.state = self.State.RELEASING
+        self.state = self.State.IDLE
 
-        async def remove_cis_async():
-            if self.cis_link:
-                await self.cis_link.remove_data_path([self.role])
-            self.state = self.State.IDLE
-            await self.service.device.notify_subscribers(self, self.value)
-
-        utils.cancel_on_event(self.service.device, 'flush', remove_cis_async())
+        if self.cis_link:
+            utils.cancel_on_event(
+                self.cis_link,
+                self.cis_link.EVENT_DISCONNECTION,
+                self.cis_link.remove_data_path([self.cis_link.Direction(self.role)]),
+            )
         return (AseResponseCode.SUCCESS, AseReasonCode.NONE)
 
     @property
@@ -535,6 +533,12 @@ class AseStateMachine(gatt.Characteristic):
     def state(self, new_state: State) -> None:
         logger.debug(f'{self} state change -> {colors.color(new_state.name, "cyan")}')
         self._state = new_state
+        # Notify clients.
+        utils.cancel_on_event(
+            self.service.device,
+            self.service.device.EVENT_FLUSH,
+            self.service.device.notify_subscribers(self, self.value),
+        )
         self.emit(self.EVENT_STATE_CHANGE)
 
     @property
@@ -710,19 +714,11 @@ class AudioStreamControlService(gatt.TemplateService):
         ) + b''.join(map(bytes, responses))
         utils.cancel_on_event(
             self.device,
-            'flush',
+            self.device.EVENT_FLUSH,
             self.device.notify_subscribers(
                 self.ase_control_point, control_point_notification
             ),
         )
-
-        for ase_id, *_ in responses:
-            if ase := self.ase_state_machines.get(ase_id):
-                utils.cancel_on_event(
-                    self.device,
-                    'flush',
-                    self.device.notify_subscribers(ase, ase.value),
-                )
 
 
 # -----------------------------------------------------------------------------
