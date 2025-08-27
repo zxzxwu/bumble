@@ -48,6 +48,7 @@ from bumble.sdp import (
     SDP_SERVICE_CLASS_ID_LIST_ATTRIBUTE_ID,
     SDP_SERVICE_RECORD_HANDLE_ATTRIBUTE_ID,
     SDP_SUPPORTED_FEATURES_ATTRIBUTE_ID,
+    SDP_ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
     DataElement,
     ServiceAttribute,
 )
@@ -89,6 +90,13 @@ class PduId(utils.OpenIntEnum):
 
 class CharacterSetId(hci.SpecableEnum):
     UTF_8 = 0x06
+
+    @classmethod
+    def parse_from_bytes(cls, data: bytes, offset: int) -> tuple[int, CharacterSetId]:
+        return offset + 2, cls(struct.unpack_from('>H', data, offset)[0])
+
+    def __bytes__(self) -> bytes:
+        return struct.pack('>H', self.value)
 
 
 class MediaAttributeId(hci.SpecableEnum):
@@ -155,18 +163,42 @@ class StatusCode(hci.SpecableEnum):
     ADDRESSED_PLAYER_CHANGED = 0x16
 
 
+class ControllerFeatures(enum.IntFlag):
+    # fmt: off
+    CATEGORY_1                                      = 1 << 0
+    CATEGORY_2                                      = 1 << 1
+    CATEGORY_3                                      = 1 << 2
+    CATEGORY_4                                      = 1 << 3
+    SUPPORTS_BROWSING                               = 1 << 6
+    SUPPORTS_COVER_ART_GET_IMAGE_PROPERTIES_FEATURE = 1 << 7
+    SUPPORTS_COVER_ART_GET_IMAGE_FEATURE            = 1 << 8
+    SUPPORTS_COVER_ART_GET_LINKED_THUMBNAIL_FEATURE = 1 << 9
+
+
+class TargetFeatures(enum.IntFlag):
+    # fmt: off
+    CATEGORY_1                                  = 1 << 0
+    CATEGORY_2                                  = 1 << 1
+    CATEGORY_3                                  = 1 << 2
+    CATEGORY_4                                  = 1 << 3
+    PLAYER_APPLICATION_SETTINGS                 = 1 << 4
+    GROUP_NAVIGATION                            = 1 << 5
+    SUPPORTS_BROWSING                           = 1 << 6
+    SUPPORTS_MULTIPLE_MEDIA_PLAYER_APPLICATIONS = 1 << 7
+    SUPPORTS_COVER_ART                          = 1 << 8
+
+
 # -----------------------------------------------------------------------------
 def make_controller_service_sdp_records(
     service_record_handle: int,
     avctp_version: tuple[int, int] = (1, 4),
     avrcp_version: tuple[int, int] = (1, 6),
-    supported_features: int = 1,
+    supported_features: Union[int, ControllerFeatures] = 1,
 ) -> list[ServiceAttribute]:
-    # TODO: support a way to compute the supported features from a feature list
     avctp_version_int = avctp_version[0] << 8 | avctp_version[1]
     avrcp_version_int = avrcp_version[0] << 8 | avrcp_version[1]
 
-    return [
+    attributes = [
         ServiceAttribute(
             SDP_SERVICE_RECORD_HANDLE_ATTRIBUTE_ID,
             DataElement.unsigned_integer_32(service_record_handle),
@@ -221,6 +253,31 @@ def make_controller_service_sdp_records(
             DataElement.unsigned_integer_16(supported_features),
         ),
     ]
+    if supported_features & ControllerFeatures.SUPPORTS_BROWSING:
+        attributes.append(
+            ServiceAttribute(
+                SDP_ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
+                DataElement.sequence(
+                    [
+                        DataElement.sequence(
+                            [
+                                DataElement.uuid(core.BT_L2CAP_PROTOCOL_ID),
+                                DataElement.unsigned_integer_16(
+                                    avctp.AVCTP_BROWSING_PSM
+                                ),
+                            ]
+                        ),
+                        DataElement.sequence(
+                            [
+                                DataElement.uuid(core.BT_AVCTP_PROTOCOL_ID),
+                                DataElement.unsigned_integer_16(avctp_version_int),
+                            ]
+                        ),
+                    ]
+                ),
+            ),
+        )
+    return attributes
 
 
 # -----------------------------------------------------------------------------
@@ -228,13 +285,13 @@ def make_target_service_sdp_records(
     service_record_handle: int,
     avctp_version: tuple[int, int] = (1, 4),
     avrcp_version: tuple[int, int] = (1, 6),
-    supported_features: int = 0x23,
+    supported_features: Union[int, TargetFeatures] = 0x23,
 ) -> list[ServiceAttribute]:
     # TODO: support a way to compute the supported features from a feature list
     avctp_version_int = avctp_version[0] << 8 | avctp_version[1]
     avrcp_version_int = avrcp_version[0] << 8 | avrcp_version[1]
 
-    return [
+    attributes = [
         ServiceAttribute(
             SDP_SERVICE_RECORD_HANDLE_ATTRIBUTE_ID,
             DataElement.unsigned_integer_32(service_record_handle),
@@ -288,6 +345,42 @@ def make_target_service_sdp_records(
             DataElement.unsigned_integer_16(supported_features),
         ),
     ]
+    if supported_features & TargetFeatures.SUPPORTS_BROWSING:
+        attributes.append(
+            ServiceAttribute(
+                SDP_ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
+                DataElement.sequence(
+                    [
+                        DataElement.sequence(
+                            [
+                                DataElement.uuid(core.BT_L2CAP_PROTOCOL_ID),
+                                DataElement.unsigned_integer_16(
+                                    avctp.AVCTP_BROWSING_PSM
+                                ),
+                            ]
+                        ),
+                        DataElement.sequence(
+                            [
+                                DataElement.uuid(core.BT_AVCTP_PROTOCOL_ID),
+                                DataElement.unsigned_integer_16(avctp_version_int),
+                            ]
+                        ),
+                    ]
+                ),
+            ),
+        )
+    return attributes
+
+
+# -----------------------------------------------------------------------------
+def decode_string(value: bytes, character_set: CharacterSetId) -> str:
+    try:
+        if character_set == CharacterSetId.UTF_8:
+            return value.decode("utf-8")
+        return value.decode("ascii")
+    except UnicodeDecodeError:
+        logger.warning(f"cannot decode string with bytes: {value.hex()}")
+        return value.hex()
 
 
 # -----------------------------------------------------------------------------
@@ -296,18 +389,6 @@ class MediaAttribute:
     attribute_id: MediaAttributeId
     attribute_value: str
     character_set_id: CharacterSetId = CharacterSetId.UTF_8
-
-    @classmethod
-    def _decode_attribute_value(
-        cls, value: bytes, character_set: CharacterSetId
-    ) -> str:
-        try:
-            if character_set == CharacterSetId.UTF_8:
-                return value.decode("utf-8")
-            return value.decode("ascii")
-        except UnicodeDecodeError:
-            logger.warning(f"cannot decode string with bytes: {value.hex()}")
-            return value.hex()
 
     @classmethod
     def parse_from_bytes(cls, pdu: bytes, offset: int) -> tuple[int, MediaAttribute]:
@@ -321,9 +402,7 @@ class MediaAttribute:
         return offset + 8 + attribute_value_length, cls(
             attribute_id=MediaAttributeId(attribute_id_int),
             character_set_id=character_set_id,
-            attribute_value=cls._decode_attribute_value(
-                attribute_value_bytes, character_set_id
-            ),
+            attribute_value=decode_string(attribute_value_bytes, character_set_id),
         )
 
     def __bytes__(self) -> bytes:
@@ -489,6 +568,15 @@ class RegisterNotificationCommand(Command):
 
 
 # -----------------------------------------------------------------------------
+@Command.command
+@dataclass
+class SetBrowsedCommand(Command):
+    pdu_id = PduId.SET_BROWSED_PLAYER
+
+    player_id: int = field(metadata=hci.metadata('>2'))
+
+
+# -----------------------------------------------------------------------------
 class Response:
     pdu_id: PduId
     _payload: Optional[bytes] = None
@@ -608,6 +696,45 @@ class RegisterNotificationResponse(Response):
     event: Event = field(
         metadata=hci.metadata(
             lambda data, offset: (len(data), Event.from_bytes(data[offset:]))
+        )
+    )
+
+
+# -----------------------------------------------------------------------------
+@Response.register
+@dataclass
+class SetBrowsedResponse(Response):
+    pdu_id = PduId.SET_BROWSED_PLAYER
+
+    @classmethod
+    def _parse_folder_name(cls, data: bytes, offset: int) -> tuple[int, str]:
+        length = struct.unpack_from('>H', data, offset)[0]
+        offset += 2
+        return offset + length, decode_string(
+            data[offset : offset + length], character_set=CharacterSetId.UTF_8
+        )
+
+    @classmethod
+    def _serialize_folder_name(cls, folder_name: str) -> bytes:
+        data = folder_name.encode('utf-8')
+        return struct.pack('>H', len(data)) + data
+
+    status: StatusCode = field(metadata=StatusCode.type_metadata(1))
+    uid_counter: int = field(metadata=hci.metadata('>2'))
+    numbers_of_items: int = field(metadata=hci.metadata('>4'))
+    character_set_id: CharacterSetId = field(
+        metadata=hci.metadata(CharacterSetId.parse_from_bytes)
+    )
+    folder_names: Sequence[str] = field(
+        metadata=hci.metadata(
+            {
+                'parser': lambda data, offset: SetBrowsedResponse._parse_folder_name(
+                    data, offset
+                ),
+                'serialize': lambda x: SetBrowsedResponse._serialize_folder_name(x),
+            },
+            list_begin=True,
+            list_end=True,
         )
     )
 
