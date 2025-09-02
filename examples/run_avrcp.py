@@ -44,10 +44,14 @@ def sdp_records():
             a2dp_sink_service_record_handle
         ),
         avrcp_controller_service_record_handle: avrcp.make_controller_service_sdp_records(
-            avrcp_controller_service_record_handle
+            avrcp_controller_service_record_handle,
+            supported_features=avrcp.ControllerFeatures.CATEGORY_1
+            | avrcp.ControllerFeatures.SUPPORTS_BROWSING,
         ),
         avrcp_target_service_record_handle: avrcp.make_target_service_sdp_records(
-            avrcp_controller_service_record_handle
+            avrcp_controller_service_record_handle,
+            supported_features=avrcp.TargetFeatures.CATEGORY_1
+            | avrcp.TargetFeatures.SUPPORTS_BROWSING,
         ),
     }
 
@@ -396,7 +400,16 @@ async def main() -> None:
             sink.on('rtp_packet', on_rtp_packet)
 
             await avrcp_protocol.connect(connection)
+            await avrcp_protocol.connect_browsing(connection)
 
+            await avrcp_protocol.send_browsing_command(
+                avrcp.GetFolderItemsCommand(
+                    avrcp.GetFolderItemsCommand.Scope.MEDIA_PLAYER_LIST,
+                    start_item=0,
+                    end_item=15,
+                    attributes=(),
+                )
+            )
         else:
             # Start being discoverable and connectable
             await device.set_discoverable(True)

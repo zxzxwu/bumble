@@ -144,9 +144,9 @@ class MessageAssembler:
 
 # -----------------------------------------------------------------------------
 class Protocol:
-    CommandHandler = Callable[[int, avc.CommandFrame], None]
+    CommandHandler = Callable[[int, bytes], None]
     command_handlers: dict[int, CommandHandler]  # Command handlers, by PID
-    ResponseHandler = Callable[[int, Optional[avc.ResponseFrame]], None]
+    ResponseHandler = Callable[[int, Optional[bytes]], None]
     response_handlers: dict[int, ResponseHandler]  # Response handlers, by PID
     next_transaction_label: int
     message_assembler: MessageAssembler
@@ -157,10 +157,11 @@ class Protocol:
         CONTINUE = 0b10
         END = 0b11
 
-    def __init__(self, l2cap_channel: l2cap.ClassicChannel) -> None:
+    def __init__(self, l2cap_channel: l2cap.ClassicChannel, use_avc: bool) -> None:
         self.command_handlers = {}
         self.response_handlers = {}
         self.l2cap_channel = l2cap_channel
+        self.use_avc = use_avc
         self.message_assembler = MessageAssembler(self.on_message)
 
         # Register to receive PDUs from the channel
@@ -197,27 +198,21 @@ class Protocol:
         if ipid:
             logger.debug(f"received IPID for PID={pid}")
 
-        # Find the appropriate handler.
         if is_command:
+            # Find the appropriate handler.
             if pid not in self.command_handlers:
                 logger.warning(f"no command handler for PID {pid}")
                 self.send_ipid(transaction_label, pid)
                 return
 
-            command_frame = cast(avc.CommandFrame, avc.Frame.from_bytes(payload))
-            self.command_handlers[pid](transaction_label, command_frame)
+            self.command_handlers[pid](transaction_label, payload)
         else:
             if pid not in self.response_handlers:
                 logger.warning(f"no response handler for PID {pid}")
                 return
 
             # By convention, for an ipid, send a None payload to the response handler.
-            if ipid:
-                response_frame = None
-            else:
-                response_frame = cast(avc.ResponseFrame, avc.Frame.from_bytes(payload))
-
-            self.response_handlers[pid](transaction_label, response_frame)
+            self.response_handlers[pid](transaction_label, None if ipid else payload)
 
     def send_message(
         self,

@@ -1667,6 +1667,7 @@ class Protocol(utils.EventEmitter):
     response_pdu_assembler: PduAssembler
     receive_response_state: Optional[ReceiveResponseState]
     avctp_protocol: Optional[avctp.Protocol]
+    avctp_browsing_protocol: Optional[avctp.Protocol]
     free_commands: asyncio.Queue
     pending_commands: dict[int, PendingCommand]  # Pending commands, by label
     notification_listeners: dict[EventId, NotificationListener]
@@ -1693,6 +1694,7 @@ class Protocol(utils.EventEmitter):
         self.response_pdu_assembler = PduAssembler(self._on_response_pdu)
         self.receive_response_state = None
         self.avctp_protocol = None
+        self.avctp_browsing_protocol = None
         self.notification_listeners = {}
 
         # Create an initial pool of free commands
@@ -1711,6 +1713,10 @@ class Protocol(utils.EventEmitter):
         device.create_l2cap_server(
             l2cap.ClassicChannelSpec(avctp.AVCTP_PSM), self._on_avctp_connection
         )
+        device.create_l2cap_server(
+            l2cap.ClassicChannelSpec(avctp.AVCTP_BROWSING_PSM),
+            self._on_avctp_connection,
+        )
 
     async def connect(self, connection: Connection) -> None:
         """
@@ -1720,6 +1726,15 @@ class Protocol(utils.EventEmitter):
             l2cap.ClassicChannelSpec(psm=avctp.AVCTP_PSM)
         )
         self._on_avctp_channel_open(avctp_channel)
+
+    async def connect_browsing(self, connection: Connection) -> None:
+        """
+        Connect to a peer.
+        """
+        browsing_channel = await connection.create_l2cap_channel(
+            l2cap.ClassicChannelSpec(psm=avctp.AVCTP_BROWSING_PSM)
+        )
+        self._on_avctp_channel_open(browsing_channel)
 
     async def _obtain_pending_command(self) -> PendingCommand:
         pending_command = await self.free_commands.get()
@@ -2010,34 +2025,83 @@ class Protocol(utils.EventEmitter):
             l2cap_channel.EVENT_OPEN, lambda: self._on_avctp_channel_open(l2cap_channel)
         )
 
-        self.emit(self.EVENT_CONNECTION)
+        if l2cap_channel.psm == avctp.AVCTP_PSM:
+            self.emit(self.EVENT_CONNECTION)
 
     def _on_avctp_channel_open(self, l2cap_channel: l2cap.ClassicChannel) -> None:
-        logger.debug("AVCTP channel open")
-        if self.avctp_protocol is not None:
-            # TODO: find a better strategy instead of just closing
-            logger.warning("AVCTP protocol already active, closing connection")
-            utils.AsyncRunner.spawn(l2cap_channel.disconnect())
-            return
+        if l2cap_channel.psm == avctp.AVCTP_PSM:
+            logger.debug("AVCTP channel open")
+            if self.avctp_protocol is not None:
+                # TODO: find a better strategy instead of just closing
+                logger.warning("AVCTP protocol already active, closing connection")
+                utils.AsyncRunner.spawn(l2cap_channel.disconnect())
+                return
 
-        self.avctp_protocol = avctp.Protocol(l2cap_channel)
-        self.avctp_protocol.register_command_handler(AVRCP_PID, self._on_avctp_command)
-        self.avctp_protocol.register_response_handler(
-            AVRCP_PID, self._on_avctp_response
+            protocol = self.avctp_protocol = avctp.Protocol(l2cap_channel, use_avc=True)
+            protocol.register_command_handler(AVRCP_PID, self._on_avc_command)
+            protocol.register_response_handler(AVRCP_PID, self._on_avc_response)
+            self.emit(self.EVENT_START)
+        elif l2cap_channel.psm == avctp.AVCTP_BROWSING_PSM:
+            logger.debug("AVCTP Browsing channel open")
+            if self.avctp_browsing_protocol is not None:
+                # TODO: find a better strategy instead of just closing
+                logger.warning(
+                    "AVCTP browsing protocol already active, closing connection"
+                )
+                utils.AsyncRunner.spawn(l2cap_channel.disconnect())
+                return
+
+            protocol = self.avctp_browsing_protocol = avctp.Protocol(
+                l2cap_channel, use_avc=False
+            )
+            protocol.register_command_handler(AVRCP_PID, self._on_browsing_command)
+            protocol.register_response_handler(AVRCP_PID, self._on_browsing_response)
+        l2cap_channel.on(
+            l2cap_channel.EVENT_CLOSE,
+            lambda: self._on_avctp_channel_close(l2cap_channel),
         )
-        l2cap_channel.on(l2cap_channel.EVENT_CLOSE, self._on_avctp_channel_close)
 
-        self.emit(self.EVENT_START)
-
-    def _on_avctp_channel_close(self) -> None:
-        logger.debug("AVCTP channel closed")
-        self.avctp_protocol = None
+    def _on_avctp_channel_close(self, l2cap_channel: l2cap.ClassicChannel) -> None:
+        if l2cap_channel.psm == avctp.AVCTP_PSM:
+            logger.debug("AVCTP channel closed")
+            self.avctp_protocol = None
+        elif l2cap_channel.psm == avctp.AVCTP_BROWSING_PSM:
+            logger.debug("AVCTP browsing channel closed")
+            self.avctp_browsing_protocol = None
 
         self.emit(self.EVENT_STOP)
 
-    def _on_avctp_command(
-        self, transaction_label: int, command: avc.CommandFrame
+    def _on_browsing_command(self, transaction_label: int, pdu: bytes) -> None:
+        pdu_id, length = struct.unpack_from('>BH', pdu)
+        command = Command.from_bytes(pdu_id=pdu_id, pdu=pdu[3:])
+        logger.debug(
+            "<<< Browsing Command, transaction_label=%s: %s",
+            transaction_label,
+            command,
+        )
+
+    def _on_browsing_response(
+        self, transaction_label: int, pdu: Optional[bytes]
     ) -> None:
+        if not pdu:
+            return
+        response = Response.from_bytes(pdu=pdu[3:], pdu_id=PduId(pdu[0]))
+        logger.debug(
+            "<<< Browsing Response, transaction_label=%s: %s",
+            transaction_label,
+            response,
+        )
+
+        # Check that we have a pending command that matches this response.
+        if not (pending_command := self.pending_commands.get(transaction_label)):
+            logger.warning("no pending command with this transaction label")
+            return
+        pending_command.response.set_result(response)
+
+    def _on_avc_command(self, transaction_label: int, pdu: bytes) -> None:
+        command = avc.Frame.from_bytes(pdu)
+        if not isinstance(command, avc.CommandFrame):
+            raise core.InvalidPacketError(f"Expect CommandFrame, got {command}")
         logger.debug(
             f"<<< AVCTP Command, transaction_label={transaction_label}: " f"{command}"
         )
@@ -2095,9 +2159,10 @@ class Protocol(utils.EventEmitter):
         # TODO handle other types
         self.send_not_implemented_response(transaction_label, command)
 
-    def _on_avctp_response(
-        self, transaction_label: int, response: Optional[avc.ResponseFrame]
-    ) -> None:
+    def _on_avc_response(self, transaction_label: int, pdu: Optional[bytes]) -> None:
+        response = avc.Frame.from_bytes(pdu) if pdu else None
+        if not isinstance(response, avc.ResponseFrame):
+            raise core.InvalidPacketError(f"Expect ResponseFrame, got {response}")
         logger.debug(
             f"<<< AVCTP Response, transaction_label={transaction_label}: {response}"
         )
@@ -2307,6 +2372,24 @@ class Protocol(utils.EventEmitter):
             pdu,
         )
         self.send_command(pending_command.transaction_label, command_frame)
+
+        # Wait for the response.
+        return await pending_command.response
+
+    async def send_browsing_command(self, command: Command) -> ResponseContext:
+        if not self.avctp_browsing_protocol:
+            raise core.InvalidStateError("Browsing channel is not opened.")
+
+        # Wait for a free command slot.
+        pending_command = await self._obtain_pending_command()
+
+        # Send the command.
+        logger.debug(">>> Browsing command PDU: %s", command)
+        payload = bytes(command)
+        pdu = struct.pack(">BH", command.pdu_id, len(payload)) + payload
+        self.avctp_browsing_protocol.send_command(
+            pending_command.transaction_label, AVRCP_PID, pdu
+        )
 
         # Wait for the response.
         return await pending_command.response
