@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
 import itertools
 import logging
@@ -25,7 +26,7 @@ import random
 import struct
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
-from bumble import hci, lmp
+from bumble import hci, lmp, ll
 from bumble.colors import color
 from bumble.core import PhysicalTransport
 
@@ -52,6 +53,24 @@ class CisLink:
     handle: int
     cis_id: int
     cig_id: int
+
+    sdu_interval_c_to_p: int
+    sdu_interval_p_to_c: int
+    phy_c_to_p: int = hci.Phy.LE_1M
+    phy_p_to_c: int = hci.Phy.LE_1M
+
+    # Controller-determined parameters - ignored.
+    nse: int = 0
+    bn_c_to_p: int = 0
+    bn_p_to_c: int = 0
+    ft_c_to_p: int = 0
+    ft_p_to_c: int = 0
+    max_pdu_c_to_p: int = 0
+    max_pdu_p_to_c: int = 0
+    iso_interval: int = 0
+
+    conn_event_count: int = 0
+
     acl_connection: Optional[Connection] = None
     data_paths: set[int] = dataclasses.field(default_factory=set)
 
@@ -105,7 +124,12 @@ class Controller:
         hci.Address, Connection
     ]  # Connections where this controller is the peripheral
     classic_connections: dict[hci.Address, Connection]  # Connections in BR/EDR
-    classic_pending_commands: dict[hci.Address, dict[lmp.Opcode, asyncio.Future[int]]]
+    classic_pending_commands: collections.defaultdict[
+        hci.Address, dict[lmp.Opcode, asyncio.Future[int]]
+    ]
+    ll_pending_control_events: collections.defaultdict[
+        hci.Address, dict[int, asyncio.Future[int]]
+    ]
     sco_links: dict[hci.Address, ScoLink]  # SCO links by address
     central_cis_links: dict[int, CisLink]  # CIS links by handle
     peripheral_cis_links: dict[int, CisLink]  # CIS links by handle
@@ -163,6 +187,7 @@ class Controller:
     advertising_timer_handle: Optional[asyncio.Handle] = None
     classic_scan_enable: int = 0
     classic_allow_role_switch: bool = True
+    _next_le_conn_event_count = 0
 
     _random_address: hci.Address = hci.Address('00:00:00:00:00:00')
 
@@ -180,7 +205,6 @@ class Controller:
         self.peripheral_connections = {}
         self.classic_connections = {}
         self.sco_links = {}
-        self.classic_pending_commands = {}
         self.central_cis_links = {}
         self.peripheral_cis_links = {}
         self.default_phy = {
@@ -188,6 +212,8 @@ class Controller:
             'tx_phys': 0,
             'rx_phys': 0,
         }
+        self.classic_pending_commands = collections.defaultdict(dict)
+        self.ll_pending_control_events = collections.defaultdict(dict)
 
         if isinstance(public_address, hci.Address):
             self._public_address = public_address
@@ -332,6 +358,10 @@ class Controller:
             handle for handle in range(0xEFF + 1) if handle not in current_handles
         )
 
+    def next_conn_event_count(self) -> int:
+        self._next_le_conn_event_count += 1
+        return self._next_le_conn_event_count
+
     def find_le_connection_by_address(
         self, address: hci.Address
     ) -> Optional[Connection]:
@@ -383,7 +413,50 @@ class Controller:
             handle
         )
 
-    def on_link_central_connected(self, central_address: hci.Address) -> None:
+    def le_request_cis(self, cis_link: CisLink) -> None:
+        connection = cis_link.acl_connection
+        assert connection
+
+        def on_response(future: asyncio.Future[int]) -> None:
+            # Note: Here we skip LL_CIS_IND, because it's not necessary to handshake
+            # three times in emulation and it's not easy to perform it.
+            self.on_le_cis_established(
+                cig_id=cis_link.cig_id, cis_id=cis_link.cis_id, status=future.result()
+            )
+
+        cis_link.conn_event_count = self.next_conn_event_count()
+        future = self.ll_pending_control_events[connection.peer_address][
+            cis_link.conn_event_count
+        ] = asyncio.get_running_loop().create_future()
+        future.add_done_callback(on_response)
+        self.send_ll_control_pdu(
+            connection.peer_address,
+            ll.LLCisReq(
+                cig_id=cis_link.cig_id,
+                cis_id=cis_link.cis_id,
+                phy_c_to_p=cis_link.phy_c_to_p,
+                phy_p_to_c=cis_link.phy_p_to_c,
+                max_sdu_c_to_p=0,
+                framing_mode=0,
+                max_sdu_p_to_c=0,
+                sdu_interval_c_to_p=cis_link.sdu_interval_c_to_p,
+                sdu_interval_p_to_c=cis_link.sdu_interval_p_to_c,
+                max_pdu_c_to_p=cis_link.max_pdu_c_to_p,
+                max_pdu_p_to_c=cis_link.max_pdu_p_to_c,
+                nse=cis_link.nse,
+                sub_interval=0,
+                bn_c_to_p=cis_link.bn_c_to_p,
+                bn_p_to_c=cis_link.bn_p_to_c,
+                ft_c_to_p=cis_link.ft_c_to_p,
+                ft_p_to_c=cis_link.ft_p_to_c,
+                iso_interval=cis_link.iso_interval,
+                cis_offset_min=0,
+                cis_offset_max=0,
+                conn_event_count=cis_link.conn_event_count,
+            ),
+        )
+
+    def on_le_central_connected(self, central_address: hci.Address) -> None:
         '''
         Called when an incoming connection occurs from a central on the link
         '''
@@ -421,7 +494,7 @@ class Controller:
             )
         )
 
-    def on_link_disconnected(self, peer_address: hci.Address, reason: int) -> None:
+    def on_le_acl_disconnected(self, peer_address: hci.Address, reason: int) -> None:
         '''
         Called when an active disconnection occurs from a peer
         '''
@@ -452,7 +525,7 @@ class Controller:
         else:
             logger.warning(f'!!! No peripheral connection found for {peer_address}')
 
-    def on_link_peripheral_connection_complete(
+    def on_le_peripheral_connection_complete(
         self,
         le_create_connection_command: hci.HCI_LE_Create_Connection_Command,
         status: int,
@@ -499,46 +572,7 @@ class Controller:
             )
         )
 
-    def on_link_disconnection_complete(
-        self, disconnection_command: hci.HCI_Disconnect_Command, status: int
-    ) -> None:
-        '''
-        Called when a disconnection has been completed
-        '''
-
-        # Send a disconnection complete event
-        self.send_hci_packet(
-            hci.HCI_Disconnection_Complete_Event(
-                status=status,
-                connection_handle=disconnection_command.connection_handle,
-                reason=disconnection_command.reason,
-            )
-        )
-
-        # Remove the connection
-        if connection := self.find_central_connection_by_handle(
-            disconnection_command.connection_handle
-        ):
-            logger.debug(f'CENTRAL Connection removed: {connection}')
-            del self.central_connections[connection.peer_address]
-        elif connection := self.find_peripheral_connection_by_handle(
-            disconnection_command.connection_handle
-        ):
-            logger.debug(f'PERIPHERAL Connection removed: {connection}')
-            del self.peripheral_connections[connection.peer_address]
-
-    def on_link_encrypted(
-        self, peer_address: hci.Address, _rand: bytes, _ediv: int, _ltk: bytes
-    ) -> None:
-        # For now, just setup the encryption without asking the host
-        if connection := self.find_le_connection_by_address(peer_address):
-            self.send_hci_packet(
-                hci.HCI_Encryption_Change_Event(
-                    status=0, connection_handle=connection.handle, encryption_enabled=1
-                )
-            )
-
-    def on_link_acl_data(
+    def on_acl_data(
         self, sender_address: hci.Address, transport: PhysicalTransport, data: bytes
     ) -> None:
         # Look for the connection to which this data belongs
@@ -555,9 +589,7 @@ class Controller:
         acl_packet = hci.HCI_AclDataPacket(connection.handle, 2, 0, len(data), data)
         self.send_hci_packet(acl_packet)
 
-    def on_link_advertising_data(
-        self, sender_address: hci.Address, data: bytes
-    ) -> None:
+    def on_le_advertising_data(self, sender_address: hci.Address, data: bytes) -> None:
         # Ignore if we're not scanning
         if self.le_scan_enable == 0:
             return
@@ -582,8 +614,34 @@ class Controller:
         )
         self.send_hci_packet(hci.HCI_LE_Advertising_Report_Event([report]))
 
-    def on_link_cis_request(
-        self, central_address: hci.Address, cig_id: int, cis_id: int
+    def send_ll_control_pdu(self, receiver_address: hci.Address, pdu: ll.ControlPdu):
+        logger.info("<<< [%s] %s", self.name, pdu)
+        assert self.link
+        self.link.send_ll_control_pdu(self, receiver_address, pdu)
+
+    def on_ll_control_pdu(
+        self, sender_address: hci.Address, pdu: ll.ControlPdu
+    ) -> None:
+        logger.info(">>> [%s] %s", self.name, pdu)
+        connection = self.find_le_connection_by_address(sender_address)
+        assert connection
+
+        if isinstance(pdu, ll.LLTerminateInd):
+            self.on_le_acl_disconnected(sender_address, pdu.error_code)
+        elif isinstance(pdu, ll.LLEncReq):
+            pass
+        elif isinstance(pdu, ll.LLCisReq):
+            self.on_le_cis_request(sender_address, pdu)
+        elif isinstance(pdu, ll.LLCisRsp):
+            if future := self.ll_pending_control_events[sender_address].get(
+                pdu.conn_event_count
+            ):
+                future.set_result(hci.HCI_SUCCESS)
+        elif isinstance(pdu, ll.LLCisTerminateInd):
+            self.on_le_cis_disconnected(cig_id=pdu.cig_id, cis_id=pdu.cis_id)
+
+    def on_le_cis_request(
+        self, central_address: hci.Address, request: ll.LLCisReq
     ) -> None:
         '''
         Called when an incoming CIS request occurs from a central on the link
@@ -594,9 +652,22 @@ class Controller:
 
         pending_cis_link = CisLink(
             handle=self.allocate_connection_handle(),
-            cis_id=cis_id,
-            cig_id=cig_id,
+            cis_id=request.cis_id,
+            cig_id=request.cig_id,
             acl_connection=connection,
+            sdu_interval_c_to_p=request.sdu_interval_c_to_p,
+            sdu_interval_p_to_c=request.sdu_interval_p_to_c,
+            phy_c_to_p=request.phy_c_to_p,
+            phy_p_to_c=request.phy_p_to_c,
+            nse=request.nse,
+            bn_c_to_p=request.bn_c_to_p,
+            bn_p_to_c=request.bn_p_to_c,
+            ft_c_to_p=request.ft_c_to_p,
+            ft_p_to_c=request.ft_p_to_c,
+            max_pdu_c_to_p=request.max_pdu_c_to_p,
+            max_pdu_p_to_c=request.max_pdu_p_to_c,
+            iso_interval=request.iso_interval,
+            conn_event_count=request.conn_event_count,
         )
         self.peripheral_cis_links[pending_cis_link.handle] = pending_cis_link
 
@@ -604,12 +675,12 @@ class Controller:
             hci.HCI_LE_CIS_Request_Event(
                 acl_connection_handle=connection.handle,
                 cis_connection_handle=pending_cis_link.handle,
-                cig_id=cig_id,
-                cis_id=cis_id,
+                cig_id=pending_cis_link.cig_id,
+                cis_id=pending_cis_link.cis_id,
             )
         )
 
-    def on_link_cis_established(self, cig_id: int, cis_id: int) -> None:
+    def on_le_cis_established(self, cig_id: int, cis_id: int, status: int) -> None:
         '''
         Called when an incoming CIS established.
         '''
@@ -624,27 +695,27 @@ class Controller:
 
         self.send_hci_packet(
             hci.HCI_LE_CIS_Established_Event(
-                status=hci.HCI_SUCCESS,
+                status=status,
                 connection_handle=cis_link.handle,
                 # CIS parameters are ignored.
                 cig_sync_delay=0,
                 cis_sync_delay=0,
                 transport_latency_c_to_p=0,
                 transport_latency_p_to_c=0,
-                phy_c_to_p=1,
-                phy_p_to_c=1,
-                nse=0,
-                bn_c_to_p=0,
-                bn_p_to_c=0,
-                ft_c_to_p=0,
-                ft_p_to_c=0,
-                max_pdu_c_to_p=0,
-                max_pdu_p_to_c=0,
-                iso_interval=0,
+                phy_c_to_p=cis_link.phy_c_to_p,
+                phy_p_to_c=cis_link.phy_p_to_c,
+                nse=cis_link.nse,
+                bn_c_to_p=cis_link.bn_c_to_p,
+                bn_p_to_c=cis_link.bn_p_to_c,
+                ft_c_to_p=cis_link.ft_c_to_p,
+                ft_p_to_c=cis_link.ft_p_to_c,
+                max_pdu_c_to_p=cis_link.max_pdu_c_to_p,
+                max_pdu_p_to_c=cis_link.max_pdu_p_to_c,
+                iso_interval=cis_link.iso_interval,
             )
         )
 
-    def on_link_cis_disconnected(self, cig_id: int, cis_id: int) -> None:
+    def on_le_cis_disconnected(self, cig_id: int, cis_id: int) -> None:
         '''
         Called when a CIS disconnected.
         '''
@@ -690,23 +761,23 @@ class Controller:
         loop = asyncio.get_running_loop()
         assert self.link
         self.link.send_lmp_packet(self, receiver_address, packet)
-        future = self.classic_pending_commands.setdefault(receiver_address, {})[
-            packet.opcode
-        ] = loop.create_future()
+        future = self.classic_pending_commands[receiver_address][packet.opcode] = (
+            loop.create_future()
+        )
         return future
 
     def on_lmp_packet(self, sender_address: hci.Address, packet: lmp.Packet):
         if isinstance(packet, (lmp.LmpAccepted, lmp.LmpAcceptedExt)):
-            if future := self.classic_pending_commands.setdefault(
-                sender_address, {}
-            ).get(packet.response_opcode):
+            if future := self.classic_pending_commands[sender_address].get(
+                packet.response_opcode
+            ):
                 future.set_result(hci.HCI_SUCCESS)
             else:
                 logger.error("!!! Unhandled packet: %s", packet)
         elif isinstance(packet, (lmp.LmpNotAccepted, lmp.LmpNotAcceptedExt)):
-            if future := self.classic_pending_commands.setdefault(
-                sender_address, {}
-            ).get(packet.response_opcode):
+            if future := self.classic_pending_commands[sender_address].get(
+                packet.response_opcode
+            ):
                 future.set_result(packet.error_code)
             else:
                 logger.error("!!! Unhandled packet: %s", packet)
@@ -999,23 +1070,7 @@ class Controller:
 
         # Notify the link of the disconnection
         handle = command.connection_handle
-        if connection := self.find_central_connection_by_handle(handle):
-            if self.link:
-                self.link.disconnect(
-                    self.random_address, connection.peer_address, command
-                )
-            else:
-                # Remove the connection
-                del self.central_connections[connection.peer_address]
-        elif connection := self.find_peripheral_connection_by_handle(handle):
-            if self.link:
-                self.link.disconnect(
-                    self.random_address, connection.peer_address, command
-                )
-            else:
-                # Remove the connection
-                del self.peripheral_connections[connection.peer_address]
-        elif connection := self.find_classic_connection_by_handle(handle):
+        if connection := self.find_classic_connection_by_handle(handle):
             if self.link:
                 self.send_lmp_packet(
                     connection.peer_address,
@@ -1025,6 +1080,17 @@ class Controller:
             else:
                 # Remove the connection
                 del self.classic_connections[connection.peer_address]
+        elif connection := (self.find_connection_by_handle(handle)):
+            # LE Connection.
+            if self.link:
+                self.send_ll_control_pdu(
+                    connection.peer_address, ll.LLTerminateInd(command.reason)
+                )
+                self.on_le_acl_disconnected(connection.peer_address, command.reason)
+            if connection.role == hci.Role.CENTRAL:
+                del self.central_connections[connection.peer_address]
+            else:
+                del self.peripheral_connections[connection.peer_address]
         elif sco_link := self.find_classic_sco_link_by_handle(handle):
             if self.link:
                 if (
@@ -1052,11 +1118,16 @@ class Controller:
             self.central_cis_links.get(handle) or self.peripheral_cis_links.get(handle)
         ):
             if self.link and cis_link.acl_connection:
-                self.link.disconnect_cis(
-                    initiator_controller=self,
-                    peer_address=cis_link.acl_connection.peer_address,
-                    cig_id=cis_link.cig_id,
-                    cis_id=cis_link.cis_id,
+                self.send_ll_control_pdu(
+                    cis_link.acl_connection.peer_address,
+                    ll.LLCisTerminateInd(
+                        cig_id=cis_link.cig_id,
+                        cis_id=cis_link.cis_id,
+                        error_code=command.reason,
+                    ),
+                )
+                self.on_le_cis_disconnected(
+                    cig_id=cis_link.cig_id, cis_id=cis_link.cis_id
                 )
             # Spec requires handle to be kept after disconnection.
 
@@ -1924,16 +1995,7 @@ class Controller:
             )
         ):
             logger.warning('connection not found')
-            return bytes([hci.HCI_INVALID_HCI_COMMAND_PARAMETERS_ERROR])
-
-        # Notify that the connection is now encrypted
-        self.link.on_connection_encrypted(
-            self.random_address,
-            connection.peer_address,
-            command.random_number,
-            command.encrypted_diversifier,
-            command.long_term_key,
-        )
+            return bytes([hci.HCI_UNKNOWN_CONNECTION_IDENTIFIER_ERROR])
 
         self.send_hci_packet(
             hci.HCI_Command_Status_Event(
@@ -1941,6 +2003,16 @@ class Controller:
                 num_hci_command_packets=1,
                 command_opcode=command.op_code,
             )
+        )
+
+        self.send_ll_control_pdu(
+            connection.peer_address,
+            ll.LLEncReq(
+                rand=command.random_number,
+                ediv=command.encrypted_diversifier,
+                skd_c=b'',
+                iv_c=0,
+            ),
         )
 
         return None
@@ -2191,13 +2263,19 @@ class Controller:
                 self.central_cis_links.pop(handle)
 
         handles = []
-        for cis_id in command.cis_id:
+        for cis_id, phy_c_to_p, phy_p_to_c in zip(
+            command.cis_id, command.phy_c_to_p, command.phy_p_to_c
+        ):
             handle = self.allocate_connection_handle()
             handles.append(handle)
             self.central_cis_links[handle] = CisLink(
                 cis_id=cis_id,
                 cig_id=command.cig_id,
                 handle=handle,
+                sdu_interval_c_to_p=command.sdu_interval_c_to_p,
+                sdu_interval_p_to_c=command.sdu_interval_p_to_c,
+                phy_c_to_p=phy_c_to_p,
+                phy_p_to_c=phy_p_to_c,
             )
         return struct.pack(
             '<BBB', hci.HCI_SUCCESS, command.cig_id, len(handles)
@@ -2212,25 +2290,37 @@ class Controller:
         if not self.link:
             return None
 
+        cis_links = list[CisLink]()
         for cis_handle, acl_handle in zip(
             command.cis_connection_handle, command.acl_connection_handle
         ):
             if not (connection := self.find_connection_by_handle(acl_handle)):
                 logger.error(f'Cannot find connection with handle={acl_handle}')
-                return bytes([hci.HCI_INVALID_HCI_COMMAND_PARAMETERS_ERROR])
+                self.send_hci_packet(
+                    hci.HCI_Command_Status_Event(
+                        status=hci.HCI_UNKNOWN_CONNECTION_IDENTIFIER_ERROR,
+                        num_hci_command_packets=1,
+                        command_opcode=command.op_code,
+                    )
+                )
+                return None
 
             if not (cis_link := self.central_cis_links.get(cis_handle)):
                 logger.error(f'Cannot find CIS with handle={cis_handle}')
-                return bytes([hci.HCI_INVALID_HCI_COMMAND_PARAMETERS_ERROR])
+                self.send_hci_packet(
+                    hci.HCI_Command_Status_Event(
+                        status=hci.HCI_UNKNOWN_CONNECTION_IDENTIFIER_ERROR,
+                        num_hci_command_packets=1,
+                        command_opcode=command.op_code,
+                    )
+                )
+                return None
 
             cis_link.acl_connection = connection
+            cis_links.append(cis_link)
 
-            self.link.create_cis(
-                self,
-                peripheral_address=connection.peer_address,
-                cig_id=cis_link.cig_id,
-                cis_id=cis_link.cis_id,
-            )
+        for cis_link in cis_links:
+            self.le_request_cis(cis_link)
 
         self.send_hci_packet(
             hci.HCI_Command_Status_Event(
@@ -2271,15 +2361,15 @@ class Controller:
             pending_cis_link := self.peripheral_cis_links.get(command.connection_handle)
         ):
             logger.error(f'Cannot find CIS with handle={command.connection_handle}')
-            return bytes([hci.HCI_INVALID_HCI_COMMAND_PARAMETERS_ERROR])
-
+            self.send_hci_packet(
+                hci.HCI_Command_Status_Event(
+                    status=hci.HCI_UNKNOWN_CONNECTION_IDENTIFIER_ERROR,
+                    num_hci_command_packets=1,
+                    command_opcode=command.op_code,
+                )
+            )
+            return None
         assert pending_cis_link.acl_connection
-        self.link.accept_cis(
-            peripheral_controller=self,
-            central_address=pending_cis_link.acl_connection.peer_address,
-            cig_id=pending_cis_link.cig_id,
-            cis_id=pending_cis_link.cis_id,
-        )
 
         self.send_hci_packet(
             hci.HCI_Command_Status_Event(
@@ -2287,6 +2377,17 @@ class Controller:
                 num_hci_command_packets=1,
                 command_opcode=command.op_code,
             )
+        )
+        self.send_ll_control_pdu(
+            pending_cis_link.acl_connection.peer_address,
+            ll.LLCisRsp(conn_event_count=pending_cis_link.conn_event_count),
+        )
+        # Note: Here we skip LL_CIS_IND, because it's not necessary to handshake three
+        # times in emulation.
+        self.on_le_cis_established(
+            cig_id=pending_cis_link.cig_id,
+            cis_id=pending_cis_link.cis_id,
+            status=hci.HCI_SUCCESS,
         )
         return None
 

@@ -21,7 +21,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from bumble import controller, core, hci, lmp
+from bumble import controller, core, hci, lmp, ll
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -85,11 +85,27 @@ class LocalLink:
     def on_address_changed(self, controller):
         pass
 
+    def send_ll_control_pdu(
+        self,
+        sender_controller: controller.Controller,
+        receiver_address: hci.Address,
+        packet: ll.ControlPdu,
+    ):
+        if not (receiver_controller := self.find_controller(receiver_address)):
+            raise core.InvalidArgumentError(
+                f"Unable to find controller for address {receiver_address}"
+            )
+        asyncio.get_running_loop().call_soon(
+            lambda: receiver_controller.on_ll_control_pdu(
+                sender_controller.random_address, packet
+            )
+        )
+
     def send_advertising_data(self, sender_address: hci.Address, data: bytes):
         # Send the advertising data to all controllers, except the sender
         for controller in self.controllers:
             if controller.random_address != sender_address:
-                controller.on_link_advertising_data(sender_address, data)
+                controller.on_le_advertising_data(sender_address, data)
 
     def send_acl_data(
         self,
@@ -110,7 +126,7 @@ class LocalLink:
 
         if destination_controller is not None:
             asyncio.get_running_loop().call_soon(
-                lambda: destination_controller.on_link_acl_data(
+                lambda: destination_controller.on_acl_data(
                     source_address, transport, data
                 )
             )
@@ -133,14 +149,14 @@ class LocalLink:
         if peripheral_controller := self.find_controller(
             le_create_connection_command.peer_address
         ):
-            central_controller.on_link_peripheral_connection_complete(
+            central_controller.on_le_peripheral_connection_complete(
                 le_create_connection_command, hci.HCI_SUCCESS
             )
-            peripheral_controller.on_link_central_connected(central_address)
+            peripheral_controller.on_le_central_connected(central_address)
             return
 
         # No peripheral found
-        central_controller.on_link_peripheral_connection_complete(
+        central_controller.on_le_peripheral_connection_complete(
             le_create_connection_command, hci.HCI_CONNECTION_ACCEPT_TIMEOUT_ERROR
         )
 
@@ -155,111 +171,6 @@ class LocalLink:
         )
         self.pending_connection = (central_address, le_create_connection_command)
         asyncio.get_running_loop().call_soon(self.on_connection_complete)
-
-    def on_disconnection_complete(
-        self,
-        initiating_address: hci.Address,
-        target_address: hci.Address,
-        disconnect_command: hci.HCI_Disconnect_Command,
-    ):
-        # Find the controller that initiated the disconnection
-        if not (initiating_controller := self.find_controller(initiating_address)):
-            logger.warning('!!! Initiating controller not found')
-            return
-
-        # Disconnect from the first controller with a matching address
-        if target_controller := self.find_controller(target_address):
-            target_controller.on_link_disconnected(
-                initiating_address, disconnect_command.reason
-            )
-
-        initiating_controller.on_link_disconnection_complete(
-            disconnect_command, hci.HCI_SUCCESS
-        )
-
-    def disconnect(
-        self,
-        initiating_address: hci.Address,
-        target_address: hci.Address,
-        disconnect_command: hci.HCI_Disconnect_Command,
-    ):
-        logger.debug(
-            f'$$$ DISCONNECTION {initiating_address} -> '
-            f'{target_address}: reason = {disconnect_command.reason}'
-        )
-        asyncio.get_running_loop().call_soon(
-            lambda: self.on_disconnection_complete(
-                initiating_address, target_address, disconnect_command
-            )
-        )
-
-    def on_connection_encrypted(
-        self,
-        central_address: hci.Address,
-        peripheral_address: hci.Address,
-        rand: bytes,
-        ediv: int,
-        ltk: bytes,
-    ):
-        logger.debug(f'*** ENCRYPTION {central_address} -> {peripheral_address}')
-
-        if central_controller := self.find_controller(central_address):
-            central_controller.on_link_encrypted(peripheral_address, rand, ediv, ltk)
-
-        if peripheral_controller := self.find_controller(peripheral_address):
-            peripheral_controller.on_link_encrypted(central_address, rand, ediv, ltk)
-
-    def create_cis(
-        self,
-        central_controller: controller.Controller,
-        peripheral_address: hci.Address,
-        cig_id: int,
-        cis_id: int,
-    ) -> None:
-        logger.debug(
-            f'$$$ CIS Request {central_controller.random_address} -> {peripheral_address}'
-        )
-        if peripheral_controller := self.find_controller(peripheral_address):
-            asyncio.get_running_loop().call_soon(
-                peripheral_controller.on_link_cis_request,
-                central_controller.random_address,
-                cig_id,
-                cis_id,
-            )
-
-    def accept_cis(
-        self,
-        peripheral_controller: controller.Controller,
-        central_address: hci.Address,
-        cig_id: int,
-        cis_id: int,
-    ) -> None:
-        logger.debug(
-            f'$$$ CIS Accept {peripheral_controller.random_address} -> {central_address}'
-        )
-        if central_controller := self.find_controller(central_address):
-            loop = asyncio.get_running_loop()
-            loop.call_soon(central_controller.on_link_cis_established, cig_id, cis_id)
-            loop.call_soon(
-                peripheral_controller.on_link_cis_established, cig_id, cis_id
-            )
-
-    def disconnect_cis(
-        self,
-        initiator_controller: controller.Controller,
-        peer_address: hci.Address,
-        cig_id: int,
-        cis_id: int,
-    ) -> None:
-        logger.debug(
-            f'$$$ CIS Disconnect {initiator_controller.random_address} -> {peer_address}'
-        )
-        if peer_controller := self.find_controller(peer_address):
-            loop = asyncio.get_running_loop()
-            loop.call_soon(
-                initiator_controller.on_link_cis_disconnected, cig_id, cis_id
-            )
-            loop.call_soon(peer_controller.on_link_cis_disconnected, cig_id, cis_id)
 
     ############################################################
     # Classic handlers
