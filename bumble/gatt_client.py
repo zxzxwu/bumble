@@ -350,7 +350,7 @@ class Client:
         logger.debug(f'GATT Command from client: {self._bearer_id} {command}')
         self.send_gatt_pdu(bytes(command))
 
-    async def send_request(self, request: att.ATT_PDU):
+    async def send_request(self, request: att.ATT_PDU) -> att.ATT_PDU | None:
         logger.debug(f'GATT Request from client: {self._bearer_id} {request}')
 
         # Wait until we can send (only one pending command at a time for the connection)
@@ -399,8 +399,14 @@ class Client:
         response = await self.send_request(
             att.ATT_Exchange_MTU_Request(client_rx_mtu=mtu)
         )
-        if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
-            raise att.ATT_Error(error_code=response.error_code, message=response)
+        if isinstance(response, att.ATT_Error_Response):
+            raise att.ATT_Error(
+                error_code=response.error_code, message=response.error_code.name
+            )
+        if not isinstance(response, att.ATT_Exchange_MTU_Response):
+            raise core.InvalidPacketError(
+                f"Expect ATT_Exchange_MTU_Response, got {response}"
+            )
 
         # Compute the final MTU
         self.mtu = min(mtu, response.server_rx_mtu)
@@ -477,18 +483,22 @@ class Client:
                 return []
 
             # Check if we reached the end of the iteration
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+            if isinstance(response, att.ATT_Error_Response):
                 if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                     # Unexpected end
                     logger.warning(
-                        '!!! unexpected error while discovering services: '
-                        f'{HCI_Constant.error_name(response.error_code)}'
+                        '!!! unexpected error while discovering services: %s',
+                        response.error_code.name,
                     )
                     raise att.ATT_Error(
                         error_code=response.error_code,
                         message='Unexpected error while discovering services',
                     )
                 break
+            if not isinstance(response, att.ATT_Read_By_Group_Type_Response):
+                raise core.InvalidPacketError(
+                    f"Expect ATT_Read_By_Group_Type_Response, got {response}"
+                )
 
             for (
                 attribute_handle,
@@ -555,16 +565,20 @@ class Client:
                 return []
 
             # Check if we reached the end of the iteration
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+            if isinstance(response, att.ATT_Error_Response):
                 if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                     # Unexpected end
                     logger.warning(
-                        '!!! unexpected error while discovering services: '
-                        f'{HCI_Constant.error_name(response.error_code)}'
+                        '!!! unexpected error while discovering services: %s',
+                        response.error_code.name,
                     )
                     # TODO raise appropriate exception
                     return []
                 break
+            if not isinstance(response, att.ATT_Find_By_Type_Value_Response):
+                raise core.InvalidPacketError(
+                    f"Expect ATT_Find_By_Type_Value_Response, got {response}"
+                )
 
             for attribute_handle, end_group_handle in response.handles_information:
                 if (
@@ -623,18 +637,22 @@ class Client:
                 return []
 
             # Check if we reached the end of the iteration
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+            if isinstance(response, att.ATT_Error_Response):
                 if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                     # Unexpected end
                     logger.warning(
-                        '!!! unexpected error while discovering included services: '
-                        f'{HCI_Constant.error_name(response.error_code)}'
+                        '!!! unexpected error while discovering included services: %s',
+                        response.error_code.name,
                     )
                     raise att.ATT_Error(
                         error_code=response.error_code,
                         message='Unexpected error while discovering included services',
                     )
                 break
+            if not isinstance(response, att.ATT_Read_By_Type_Response):
+                raise core.InvalidPacketError(
+                    f"Expect ATT_Read_By_Type_Response, got {response}"
+                )
 
             # Stop if for some reason the list was empty
             if not response.attributes:
@@ -697,18 +715,22 @@ class Client:
                     return []
 
                 # Check if we reached the end of the iteration
-                if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+                if isinstance(response, att.ATT_Error_Response):
                     if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                         # Unexpected end
                         logger.warning(
-                            '!!! unexpected error while discovering characteristics: '
-                            f'{HCI_Constant.error_name(response.error_code)}'
+                            '!!! unexpected error while discovering characteristics: %s',
+                            response.error_code.name,
                         )
                         raise att.ATT_Error(
                             error_code=response.error_code,
                             message='Unexpected error while discovering characteristics',
                         )
                     break
+                if not isinstance(response, att.ATT_Read_By_Type_Response):
+                    raise core.InvalidPacketError(
+                        f"Expect ATT_Read_By_Type_Response, got {response}"
+                    )
 
                 # Stop if for some reason the list was empty
                 if not response.attributes:
@@ -779,16 +801,20 @@ class Client:
                 return []
 
             # Check if we reached the end of the iteration
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+            if isinstance(response, att.ATT_Error_Response):
                 if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                     # Unexpected end
                     logger.warning(
-                        '!!! unexpected error while discovering descriptors: '
-                        f'{HCI_Constant.error_name(response.error_code)}'
+                        '!!! unexpected error while discovering descriptors: %s',
+                        response.error_code.name,
                     )
                     # TODO raise appropriate exception
                     return []
                 break
+            if not isinstance(response, att.ATT_Find_Information_Response):
+                raise core.InvalidPacketError(
+                    f"Expect ATT_Find_Information_Response, got {response}"
+                )
 
             # Stop if for some reason the list was empty
             if not response.information:
@@ -833,15 +859,19 @@ class Client:
                 return []
 
             # Check if we reached the end of the iteration
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+            if isinstance(response, att.ATT_Error_Response):
                 if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                     # Unexpected end
                     logger.warning(
-                        '!!! unexpected error while discovering attributes: '
-                        f'{HCI_Constant.error_name(response.error_code)}'
+                        '!!! unexpected error while discovering attributes: %s',
+                        response.error_code.name,
                     )
                     return []
                 break
+            if not isinstance(response, att.ATT_Find_Information_Response):
+                raise core.InvalidPacketError(
+                    f"Expect ATT_Find_Information_Response, got {response}"
+                )
 
             for attribute_handle, attribute_uuid in response.information:
                 if attribute_handle < starting_handle:
@@ -992,8 +1022,12 @@ class Client:
         )
         if response is None:
             raise TimeoutError('read timeout')
-        if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
-            raise att.ATT_Error(error_code=response.error_code, message=response)
+        if isinstance(response, att.ATT_Error_Response):
+            raise att.ATT_Error(
+                error_code=response.error_code, message=response.error_code.name
+            )
+        if not isinstance(response, att.ATT_Read_Response):
+            raise core.InvalidPacketError(f"Expect ATT_Read_Response, got {response}")
 
         # If the value is the max size for the MTU, try to read more unless the caller
         # specifically asked not to do that
@@ -1009,14 +1043,18 @@ class Client:
                 )
                 if response is None:
                     raise TimeoutError('read timeout')
-                if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+                if isinstance(response, att.ATT_Error_Response):
                     if response.error_code in (
                         att.ATT_ATTRIBUTE_NOT_LONG_ERROR,
                         att.ATT_INVALID_OFFSET_ERROR,
                     ):
                         break
                     raise att.ATT_Error(
-                        error_code=response.error_code, message=response
+                        error_code=response.error_code, message=response.error_code.name
+                    )
+                elif not isinstance(response, att.ATT_Read_Blob_Response):
+                    raise core.InvalidPacketError(
+                        f"Expect ATT_Read_Blob_Response, got {response}"
                     )
 
                 part = response.part_attribute_value
@@ -1059,16 +1097,20 @@ class Client:
                 return []
 
             # Check if we reached the end of the iteration
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
+            if isinstance(response, att.ATT_Error_Response):
                 if response.error_code != att.ATT_ATTRIBUTE_NOT_FOUND_ERROR:
                     # Unexpected end
                     logger.warning(
-                        '!!! unexpected error while reading characteristics: '
-                        f'{HCI_Constant.error_name(response.error_code)}'
+                        '!!! unexpected error while reading characteristics: %s',
+                        response.error_code.name,
                     )
                     # TODO raise appropriate exception
                     return []
                 break
+            if not isinstance(response, att.ATT_Read_By_Type_Response):
+                raise core.InvalidPacketError(
+                    f"Expect ATT_Read_By_Type_Response, got {response}"
+                )
 
             # Stop if for some reason the list was empty
             if not response.attributes:
@@ -1078,7 +1120,7 @@ class Client:
             for attribute_handle, attribute_value in response.attributes:
                 if attribute_handle < starting_handle:
                     # Something's not right
-                    logger.warning(f'bogus handle value: {attribute_handle}')
+                    logger.warning('bogus handle value: %s', attribute_handle)
                     return []
 
                 characteristics_values.append(attribute_value)
@@ -1109,8 +1151,10 @@ class Client:
                     attribute_handle=attribute_handle, attribute_value=value
                 )
             )
-            if response.op_code == att.Opcode.ATT_ERROR_RESPONSE:
-                raise att.ATT_Error(error_code=response.error_code, message=response)
+            if isinstance(response, att.ATT_Error_Response):
+                raise att.ATT_Error(
+                    error_code=response.error_code, message=response.error_code.name
+                )
         else:
             await self.send_command(
                 att.ATT_Write_Command(

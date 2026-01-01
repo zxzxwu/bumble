@@ -305,7 +305,7 @@ class ATT_Error_Response(ATT_PDU):
     attribute_handle_in_error: int = dataclasses.field(
         metadata=hci.metadata(HANDLE_FIELD_SPEC)
     )
-    error_code: int = dataclasses.field(metadata=ErrorCode.type_metadata(1))
+    error_code: ErrorCode = dataclasses.field(metadata=ErrorCode.type_metadata(1))
 
 
 # -----------------------------------------------------------------------------
