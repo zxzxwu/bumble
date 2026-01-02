@@ -2071,9 +2071,6 @@ class Address:
     ANY: Address
     ANY_RANDOM: Address
 
-    # pylint: disable-next=unnecessary-lambda
-    ADDRESS_TYPE_SPEC = {'size': 1, 'mapper': lambda x: Address.address_type_name(x)}
-
     @classmethod
     def address_type_name(cls: type[Self], address_type: int) -> str:
         return AddressType(address_type).name
@@ -2183,6 +2180,28 @@ class Address:
 
     def clone(self):
         return Address(self.address_bytes, self.address_type)
+
+    def resolve(
+        self, resolving_list: Iterable[tuple[bytes, Address]]
+    ) -> Address | None:
+        if not self.is_resolvable:
+            return None
+
+        address_bytes = bytes(self)
+        hash_part = address_bytes[0:3]
+        prand = address_bytes[3:6]
+        for irk, identity_address in resolving_list:
+            local_hash = crypto.ah(irk, prand)
+            if local_hash == hash_part:
+                # Match!
+                resolved_address = identity_address.clone()
+                if identity_address.address_type == Address.PUBLIC_DEVICE_ADDRESS:
+                    resolved_address.address_type = Address.PUBLIC_IDENTITY_ADDRESS
+                else:
+                    resolved_address.address_type = Address.RANDOM_IDENTITY_ADDRESS
+                return resolved_address
+
+        return None
 
     @property
     def is_public(self):
@@ -3990,8 +4009,8 @@ class HCI_LE_Set_Advertising_Parameters_Command(HCI_Command):
     advertising_interval_min: int = field(metadata=metadata(2))
     advertising_interval_max: int = field(metadata=metadata(2))
     advertising_type: int = field(metadata=AdvertisingType.type_metadata(1))
-    own_address_type: int = field(metadata=OwnAddressType.type_metadata(1))
-    peer_address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    own_address_type: OwnAddressType = field(metadata=OwnAddressType.type_metadata(1))
+    peer_address_type: int = field(metadata=AddressType.type_metadata(1))
     peer_address: Address = field(
         metadata=metadata(Address.parse_address_preceded_by_type)
     )
@@ -4075,7 +4094,7 @@ class HCI_LE_Set_Scan_Parameters_Command(HCI_Command):
     le_scan_type: int = field(metadata=metadata(1))
     le_scan_interval: int = field(metadata=metadata(2))
     le_scan_window: int = field(metadata=metadata(2))
-    own_address_type: int = field(metadata=OwnAddressType.type_metadata(1))
+    own_address_type: OwnAddressType = field(metadata=OwnAddressType.type_metadata(1))
     scanning_filter_policy: int = field(metadata=metadata(1))
 
     PASSIVE_SCANNING = 0
@@ -4110,11 +4129,11 @@ class HCI_LE_Create_Connection_Command(HCI_Command):
     le_scan_interval: int = field(metadata=metadata(2))
     le_scan_window: int = field(metadata=metadata(2))
     initiator_filter_policy: int = field(metadata=metadata(1))
-    peer_address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    peer_address_type: int = field(metadata=AddressType.type_metadata(1))
     peer_address: Address = field(
         metadata=metadata(Address.parse_address_preceded_by_type)
     )
-    own_address_type: int = field(metadata=OwnAddressType.type_metadata(1))
+    own_address_type: OwnAddressType = field(metadata=OwnAddressType.type_metadata(1))
     connection_interval_min: int = field(metadata=metadata(2))
     connection_interval_max: int = field(metadata=metadata(2))
     max_latency: int = field(metadata=metadata(2))
@@ -4163,7 +4182,7 @@ class HCI_LE_Add_Device_To_Filter_Accept_List_Command(HCI_Command):
     See Bluetooth spec @ 7.8.16 LE Add Device To Filter Accept List Command
     '''
 
-    address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    address_type: int = field(metadata=AddressType.type_metadata(1))
     address: Address = field(metadata=metadata(Address.parse_address_preceded_by_type))
 
 
@@ -4175,7 +4194,7 @@ class HCI_LE_Remove_Device_From_Filter_Accept_List_Command(HCI_Command):
     See Bluetooth spec @ 7.8.17 LE Remove Device From Filter Accept List Command
     '''
 
-    address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    address_type: int = field(metadata=AddressType.type_metadata(1))
     address: Address = field(metadata=metadata(Address.parse_address_preceded_by_type))
 
 
@@ -4360,9 +4379,7 @@ class HCI_LE_Add_Device_To_Resolving_List_Command(HCI_Command):
     See Bluetooth spec @ 7.8.38 LE Add Device To Resolving List Command
     '''
 
-    peer_identity_address_type: int = field(
-        metadata=metadata(Address.ADDRESS_TYPE_SPEC)
-    )
+    peer_identity_address_type: int = field(metadata=AddressType.type_metadata(1))
     peer_identity_address: Address = field(
         metadata=metadata(Address.parse_address_preceded_by_type)
     )
@@ -4545,8 +4562,8 @@ class HCI_LE_Set_Extended_Advertising_Parameters_Command(HCI_Command):
     primary_advertising_interval_min: int = field(metadata=metadata(3))
     primary_advertising_interval_max: int = field(metadata=metadata(3))
     primary_advertising_channel_map: int = field(metadata=ChannelMap.type_metadata(1))
-    own_address_type: int = field(metadata=OwnAddressType.type_metadata(1))
-    peer_address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    own_address_type: OwnAddressType = field(metadata=OwnAddressType.type_metadata(1))
+    peer_address_type: int = field(metadata=AddressType.type_metadata(1))
     peer_address: Address = field(
         metadata=metadata(Address.parse_address_preceded_by_type)
     )
@@ -5022,7 +5039,7 @@ class HCI_LE_Periodic_Advertising_Create_Sync_Command(HCI_Command):
 
     options: int = field(metadata=Options.type_metadata(1))
     advertising_sid: int = field(metadata=metadata(1))
-    advertiser_address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    advertiser_address_type: int = field(metadata=AddressType.type_metadata(1))
     advertiser_address: Address = field(
         metadata=metadata(Address.parse_address_preceded_by_type)
     )
@@ -5072,9 +5089,7 @@ class HCI_LE_Set_Privacy_Mode_Command(HCI_Command):
         NETWORK_PRIVACY_MODE = 0x00
         DEVICE_PRIVACY_MODE = 0x01
 
-    peer_identity_address_type: int = field(
-        metadata=metadata(Address.ADDRESS_TYPE_SPEC)
-    )
+    peer_identity_address_type: int = field(metadata=AddressType.type_metadata(1))
     peer_identity_address: Address = field(
         metadata=metadata(Address.parse_address_preceded_by_type)
     )
@@ -6044,7 +6059,7 @@ class HCI_LE_Advertising_Report_Event(HCI_LE_Meta_Event):
                 }
             )
         )
-        address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+        address_type: int = field(metadata=AddressType.type_metadata(1))
         address: Address = field(
             metadata=metadata(Address.parse_address_preceded_by_type)
         )
@@ -6243,7 +6258,7 @@ class HCI_LE_Extended_Advertising_Report_Event(HCI_LE_Meta_Event):
                 }
             )
         )
-        address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+        address_type: int = field(metadata=AddressType.type_metadata(1))
         address: Address = field(
             metadata=metadata(Address.parse_address_preceded_by_type)
         )
@@ -6253,7 +6268,7 @@ class HCI_LE_Extended_Advertising_Report_Event(HCI_LE_Meta_Event):
         tx_power: int = field(metadata=metadata(1))
         rssi: int = field(metadata=metadata(-1))
         periodic_advertising_interval: int = field(metadata=metadata(2))
-        direct_address_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+        direct_address_type: int = field(metadata=AddressType.type_metadata(1))
         direct_address: Address = field(
             metadata=metadata(Address.parse_address_preceded_by_type)
         )

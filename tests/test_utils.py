@@ -17,6 +17,7 @@
 # -----------------------------------------------------------------------------
 import asyncio
 import functools
+import secrets
 
 from typing_extensions import Self
 
@@ -37,7 +38,7 @@ class Devices:
         self.connections = [None for _ in range(num_devices)]
 
         self.link = LocalLink()
-        addresses = [":".join([f"F{i}"] * 6) for i in range(num_devices)]
+        addresses = [str(Address.generate_static_address()) for _ in range(num_devices)]
         self.controllers = [
             Controller(f'C{i + i}', link=self.link, public_address=addresses[i])
             for i in range(num_devices)
@@ -50,9 +51,10 @@ class Devices:
             for i in range(num_devices)
         ]
 
-        for i in range(num_devices):
-            self.devices[i].on(
-                self.devices[i].EVENT_CONNECTION,
+        for i, device in enumerate(self.devices):
+            device.irk = secrets.token_bytes(16)
+            device.on(
+                device.EVENT_CONNECTION,
                 functools.partial(self.on_connection, i),
             )
 
@@ -85,6 +87,9 @@ class Devices:
 
     def __getitem__(self, index: int) -> Device:
         return self.devices[index]
+
+    def __iter__(self):
+        return iter(self.devices)
 
 
 # -----------------------------------------------------------------------------

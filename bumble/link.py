@@ -82,7 +82,7 @@ class LocalLink:
 
     def send_acl_data(
         self,
-        sender_controller: controller.Controller,
+        source_address: hci.Address,
         destination_address: hci.Address,
         transport: core.PhysicalTransport,
         data: bytes,
@@ -90,10 +90,8 @@ class LocalLink:
         # Send the data to the first controller with a matching address
         if transport == core.PhysicalTransport.LE:
             destination_controller = self.find_le_controller(destination_address)
-            source_address = sender_controller.random_address
         elif transport == core.PhysicalTransport.BR_EDR:
             destination_controller = self.find_classic_controller(destination_address)
-            source_address = sender_controller.public_address
         else:
             raise ValueError("unsupported transport type")
 

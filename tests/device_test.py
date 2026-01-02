@@ -17,13 +17,14 @@
 # -----------------------------------------------------------------------------
 import asyncio
 import functools
+import itertools
 import logging
 import os
 from unittest import mock
 
 import pytest
 
-from bumble import gatt, hci, utils
+from bumble import gatt, hci, utils, keys
 from bumble.core import PhysicalTransport
 from bumble.device import (
     Advertisement,
@@ -800,6 +801,84 @@ async def test_remote_name_request():
     await devices[1].power_on()
     actual_name = await devices[0].request_remote_name(devices[1].public_address)
     assert actual_name == expected_name
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "central_address_type,peripheral_address_type",
+    itertools.product(
+        (
+            hci.OwnAddressType.RESOLVABLE_OR_PUBLIC,
+            hci.OwnAddressType.RESOLVABLE_OR_RANDOM,
+        ),
+        (
+            hci.OwnAddressType.RESOLVABLE_OR_PUBLIC,
+            hci.OwnAddressType.RESOLVABLE_OR_RANDOM,
+        ),
+    ),
+)
+async def test_rpa_offloading(
+    central_address_type: hci.OwnAddressType,
+    peripheral_address_type: hci.OwnAddressType,
+):
+    devices = TwoDevices()
+    for device in devices:
+        device.address_resolution_offload = True
+        device.address_generation_offload = True
+        device.le_privacy_enabled = False
+        await device.power_on()
+
+    if central_address_type == hci.OwnAddressType.RESOLVABLE_OR_PUBLIC:
+        central_address = devices[1].public_address
+    else:
+        central_address = devices[1].random_address
+    if peripheral_address_type == hci.OwnAddressType.RESOLVABLE_OR_PUBLIC:
+        peripheral_address = devices[0].public_address
+    else:
+        peripheral_address = devices[0].random_address
+
+    await devices[0].update_keys(
+        str(central_address),
+        keys.PairingKeys(irk=keys.PairingKeys.Key(devices[1].irk)),
+    )
+    await devices[1].update_keys(
+        str(peripheral_address),
+        keys.PairingKeys(irk=keys.PairingKeys.Key(devices[0].irk)),
+    )
+
+    advertisements = asyncio.Queue[Advertisement]()
+    devices[1].on(devices[1].EVENT_ADVERTISEMENT, advertisements.put_nowait)
+    await devices[1].start_scanning()
+    await devices[0].start_advertising(
+        own_address_type=peripheral_address_type,
+        advertising_interval_min=500,
+    )
+    peripheral_connections = asyncio.Queue[Connection]()
+    devices[0].on(devices[0].EVENT_CONNECTION, peripheral_connections.put_nowait)
+    advertisement = await advertisements.get()
+    assert advertisement.address == peripheral_address
+
+    connection = await devices[1].connect(
+        peripheral_address, own_address_type=central_address_type
+    )
+    assert connection.peer_address == peripheral_address
+    assert connection.peer_resolvable_address not in (
+        Address.ANY,
+        Address.ANY_RANDOM,
+        None,
+    )
+
+    peripheral_connection = await peripheral_connections.get()
+    assert peripheral_connection.peer_address == central_address
+    assert peripheral_connection.peer_resolvable_address not in (
+        Address.ANY,
+        Address.ANY_RANDOM,
+        None,
+    )
+
+    # Test ACL lookup
+    await connection.gatt_client.discover_services()
 
 
 # -----------------------------------------------------------------------------

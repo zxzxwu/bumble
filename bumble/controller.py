@@ -63,7 +63,7 @@ class LegacyAdvertiser:
     advertising_interval_min: int = 0
     advertising_interval_max: int = 0
     advertising_type: int = 0
-    own_address_type: int = 0
+    own_address_type: hci.OwnAddressType = hci.OwnAddressType.RANDOM
     peer_address_type: int = 0
     peer_address: hci.Address = hci.Address.ANY
     advertising_channel_map: int = 0
@@ -78,10 +78,19 @@ class LegacyAdvertiser:
     @property
     def address(self) -> hci.Address:
         '''Address used in advertising PDU.'''
-        if self.own_address_type == hci.Address.PUBLIC_DEVICE_ADDRESS:
-            return self.controller.public_address
-        else:
-            return self.controller.random_address
+        match self.own_address_type:
+            case hci.OwnAddressType.PUBLIC:
+                return self.controller.public_address
+            case hci.OwnAddressType.RANDOM:
+                return self.controller.random_address
+            case hci.OwnAddressType.RESOLVABLE_OR_RANDOM:
+                return self.controller.rpa_table.get(
+                    self.peer_address, self.controller.random_address
+                )
+            case hci.OwnAddressType.RESOLVABLE_OR_PUBLIC:
+                return self.controller.rpa_table.get(
+                    self.peer_address, self.controller.public_address
+                )
 
     def _on_timer_fired(self) -> None:
         self.send_advertising_data()
@@ -136,10 +145,19 @@ class AdvertisingSet:
         '''Address used in advertising PDU.'''
         if not self.parameters:
             return None
-        if self.parameters.own_address_type == hci.Address.PUBLIC_DEVICE_ADDRESS:
-            return self.controller.public_address
-        else:
-            return self.random_address
+        match self.parameters.own_address_type:
+            case hci.OwnAddressType.PUBLIC:
+                return self.controller.public_address
+            case hci.OwnAddressType.RANDOM:
+                return self.random_address
+            case hci.OwnAddressType.RESOLVABLE_OR_RANDOM:
+                return self.controller.rpa_table.get(
+                    self.parameters.peer_address, self.random_address
+                )
+            case hci.OwnAddressType.RESOLVABLE_OR_PUBLIC:
+                return self.controller.rpa_table.get(
+                    self.parameters.peer_address, self.controller.public_address
+                )
 
     def _on_extended_advertising_timer_fired(self) -> None:
         if not self.enabled:
@@ -193,6 +211,7 @@ class Connection:
     link: link.LocalLink
     transport: PhysicalTransport
     link_type: int
+    peer_resolvable_address: hci.Address | None = None
     classic_allow_role_switch: bool = False
 
     def __post_init__(self) -> None:
@@ -209,14 +228,21 @@ class Connection:
     def on_acl_pdu(self, pdu: bytes) -> None:
         if self.link:
             self.link.send_acl_data(
-                self.controller, self.peer_address, self.transport, pdu
+                self.self_address, self.peer_address, self.transport, pdu
             )
 
     def send_ll_control_pdu(self, packet: ll.ControlPdu) -> None:
         if self.link:
             self.link.send_ll_control_pdu(
                 sender_address=self.self_address,
-                receiver_address=self.peer_address,
+                receiver_address=(
+                    self.peer_resolvable_address
+                    if (
+                        self.peer_resolvable_address
+                        and self.peer_resolvable_address != hci.Address.ANY
+                    )
+                    else self.peer_address
+                ),
                 packet=packet,
             )
 
@@ -285,7 +311,7 @@ class Controller:
     le_scan_interval: int = 0x10
     le_scan_window: int = 0x10
     le_scan_enable: bool = False
-    le_scan_own_address_type: int = hci.Address.RANDOM_DEVICE_ADDRESS
+    le_scan_own_address_type: hci.OwnAddressType = hci.OwnAddressType.RANDOM
     le_scanning_filter_policy: int = 0
     le_address_resolution: bool = False
     le_rpa_timeout: int = 0
@@ -301,6 +327,15 @@ class Controller:
         | hci.HCI_LE_Extended_Create_Connection_Command
         | None
     ) = None
+
+    @dataclasses.dataclass
+    class ResolvingEntry:
+        peer_address: hci.Address
+        peer_irk: bytes
+        local_irk: bytes
+
+    resolving_list: list[ResolvingEntry]
+    rpa_table: dict[hci.Address, hci.Address]
 
     _random_address: hci.Address = hci.Address('00:00:00:00:00:00')
 
@@ -327,6 +362,8 @@ class Controller:
             'rx_phys': 0,
         }
         self.le_legacy_advertiser = LegacyAdvertiser(self)
+        self.resolving_list = []
+        self.rpa_table = {}
 
         if isinstance(public_address, hci.Address):
             self._public_address = public_address
@@ -552,7 +589,24 @@ class Controller:
             return
 
         # Allocate (or reuse) a connection handle
-        peer_address = packet.initiator_address
+        advertiser_address = advertiser.address
+        if advertiser_address.is_resolvable:
+            peer_resolvable_address = advertiser_address
+            if self.le_address_resolution:
+                peer_resolved_address = (
+                    advertiser_address.resolve(
+                        [
+                            (entry.peer_irk, entry.peer_address)
+                            for entry in self.resolving_list
+                        ]
+                    )
+                    or advertiser_address
+                )
+            else:
+                peer_resolved_address = advertiser_address
+        else:
+            peer_resolved_address = advertiser_address
+            peer_resolvable_address = advertiser_address
 
         connection_handle = self.allocate_connection_handle()
         connection = Connection(
@@ -560,28 +614,48 @@ class Controller:
             handle=connection_handle,
             role=hci.Role.PERIPHERAL,
             self_address=packet.advertiser_address,
-            peer_address=peer_address,
+            peer_address=peer_resolved_address,
+            peer_resolvable_address=peer_resolvable_address,
             link=self.link,
             transport=PhysicalTransport.LE,
             link_type=hci.HCI_Connection_Complete_Event.LinkType.ACL,
         )
-        self.le_connections[peer_address] = connection
+        self.le_connections[peer_resolved_address] = connection
         logger.debug(f'New PERIPHERAL connection handle: 0x{connection_handle:04X}')
 
         # Then say that the connection has completed
-        self.send_hci_packet(
-            hci.HCI_LE_Connection_Complete_Event(
-                status=hci.HCI_SUCCESS,
-                connection_handle=connection.handle,
-                role=connection.role,
-                peer_address_type=peer_address.address_type,
-                peer_address=peer_address,
-                connection_interval=10,  # FIXME
-                peripheral_latency=0,  # FIXME
-                supervision_timeout=10,  # FIXME
-                central_clock_accuracy=7,  # FIXME
+        if self.le_features & (
+            hci.LeFeatureMask.LL_PRIVACY | hci.LeFeatureMask.LE_EXTENDED_ADVERTISING
+        ):
+            self.send_hci_packet(
+                hci.HCI_LE_Enhanced_Connection_Complete_Event(
+                    status=hci.HCI_SUCCESS,
+                    connection_handle=connection.handle,
+                    role=connection.role,
+                    peer_address_type=peer_resolved_address.address_type,
+                    peer_address=peer_resolved_address,
+                    local_resolvable_private_address=hci.Address.ANY,  # FIXME
+                    peer_resolvable_private_address=peer_resolvable_address,
+                    connection_interval=10,  # FIXME
+                    peripheral_latency=0,  # FIXME
+                    supervision_timeout=10,  # FIXME
+                    central_clock_accuracy=7,  # FIXME
+                )
             )
-        )
+        else:
+            self.send_hci_packet(
+                hci.HCI_LE_Connection_Complete_Event(
+                    status=hci.HCI_SUCCESS,
+                    connection_handle=connection.handle,
+                    role=connection.role,
+                    peer_address_type=peer_resolved_address.address_type,
+                    peer_address=peer_resolved_address,
+                    connection_interval=10,  # FIXME
+                    peripheral_latency=0,  # FIXME
+                    supervision_timeout=10,  # FIXME
+                    central_clock_accuracy=7,  # FIXME
+                )
+            )
 
         if isinstance(advertiser, AdvertisingSet):
             self.send_hci_packet(
@@ -604,37 +678,61 @@ class Controller:
             )
         )
 
-    def create_le_connection(self, peer_address: hci.Address) -> None:
+    def create_le_connection(self, peer_advertiser_address: hci.Address) -> None:
         '''
         Called when we receive advertisement matching connection filter.
         '''
         pending_le_connection = self.pending_le_connection
         assert pending_le_connection
 
-        if self.le_connections.get(peer_address):
-            logger.error("Connection for %s already exists?", peer_address)
+        match pending_le_connection.own_address_type:
+            case hci.OwnAddressType.RANDOM:
+                self_address = self.random_address
+                local_rpa = hci.Address.ANY
+            case hci.OwnAddressType.PUBLIC:
+                self_address = self.public_address
+                local_rpa = hci.Address.ANY
+            case hci.OwnAddressType.RESOLVABLE_OR_RANDOM:
+                self_address = local_rpa = self.rpa_table.get(
+                    peer_advertiser_address, self.random_address
+                )
+            case hci.OwnAddressType.RESOLVABLE_OR_PUBLIC:
+                self_address = local_rpa = self.rpa_table.get(
+                    peer_advertiser_address, self.public_address
+                )
+
+        if self.le_address_resolution and peer_advertiser_address.is_resolvable:
+            peer_resolvable_address = peer_advertiser_address
+            peer_resolved_address = (
+                peer_advertiser_address.resolve(
+                    [
+                        (entry.peer_irk, entry.peer_address)
+                        for entry in self.resolving_list
+                    ]
+                )
+                or peer_resolvable_address
+            )
+        else:
+            peer_resolvable_address = peer_advertiser_address
+            peer_resolved_address = peer_advertiser_address
+
+        if self.le_connections.get(peer_advertiser_address):
+            logger.error("Connection for %s already exists?", peer_advertiser_address)
             return
 
-        self_address = (
-            self.public_address
-            if pending_le_connection.own_address_type == hci.OwnAddressType.PUBLIC
-            else self.random_address
-        )
-
         # Allocate (or reuse) a connection handle
-        peer_address = pending_le_connection.peer_address
         connection_handle = self.allocate_connection_handle()
         connection = Connection(
             controller=self,
             handle=connection_handle,
             role=hci.Role.CENTRAL,
             self_address=self_address,
-            peer_address=peer_address,
+            peer_address=peer_resolved_address,
             link=self.link,
             transport=PhysicalTransport.LE,
             link_type=hci.HCI_Connection_Complete_Event.LinkType.ACL,
         )
-        self.le_connections[peer_address] = connection
+        self.le_connections[peer_resolved_address] = connection
         logger.debug(f'New CENTRAL connection handle: 0x{connection_handle:04X}')
 
         if isinstance(
@@ -651,27 +749,45 @@ class Controller:
         self.send_advertising_pdu(
             ll.ConnectInd(
                 initiator_address=self_address,
-                advertiser_address=peer_address,
+                advertiser_address=peer_advertiser_address,
                 interval=interval,
                 latency=latency,
                 timeout=timeout,
             )
         )
         # Say that the connection has completed
-        self.send_hci_packet(
-            # pylint: disable=line-too-long
-            hci.HCI_LE_Connection_Complete_Event(
-                status=hci.HCI_SUCCESS,
-                connection_handle=connection.handle if connection else 0,
-                role=hci.Role.CENTRAL,
-                peer_address_type=peer_address.address_type,
-                peer_address=peer_address,
-                connection_interval=interval,
-                peripheral_latency=latency,
-                supervision_timeout=timeout,
-                central_clock_accuracy=0,
+        if self.le_features & (
+            hci.LeFeatureMask.LL_PRIVACY | hci.LeFeatureMask.LE_EXTENDED_ADVERTISING
+        ):
+            self.send_hci_packet(
+                hci.HCI_LE_Enhanced_Connection_Complete_Event(
+                    status=hci.HCI_SUCCESS,
+                    connection_handle=connection.handle if connection else 0,
+                    role=hci.Role.CENTRAL,
+                    peer_address_type=peer_resolved_address.address_type,
+                    peer_address=peer_resolved_address,
+                    connection_interval=interval,
+                    peripheral_latency=latency,
+                    supervision_timeout=timeout,
+                    central_clock_accuracy=0,
+                    local_resolvable_private_address=local_rpa,
+                    peer_resolvable_private_address=peer_resolvable_address,
+                )
             )
-        )
+        else:
+            self.send_hci_packet(
+                hci.HCI_LE_Connection_Complete_Event(
+                    status=hci.HCI_SUCCESS,
+                    connection_handle=connection.handle if connection else 0,
+                    role=hci.Role.CENTRAL,
+                    peer_address_type=peer_resolved_address.address_type,
+                    peer_address=peer_resolved_address,
+                    connection_interval=interval,
+                    peripheral_latency=latency,
+                    supervision_timeout=timeout,
+                    central_clock_accuracy=0,
+                )
+            )
         self.pending_le_connection = None
 
     def on_le_encrypted(self, connection: Connection) -> None:
@@ -705,13 +821,26 @@ class Controller:
         else:
             direct_address = None
 
+        if self.le_address_resolution:
+            peer_address = (
+                pdu.advertiser_address.resolve(
+                    [
+                        (entry.peer_irk, entry.peer_address)
+                        for entry in self.resolving_list
+                    ]
+                )
+                or pdu.advertiser_address
+            )
+        else:
+            peer_address = pdu.advertiser_address
+
         if self.le_scan_enable:
             # Send a scan report
             if self.le_features & hci.LeFeatureMask.LE_EXTENDED_ADVERTISING:
                 ext_report = hci.HCI_LE_Extended_Advertising_Report_Event.Report(
                     event_type=hci.HCI_LE_Extended_Advertising_Report_Event.EventType.CONNECTABLE_ADVERTISING,
-                    address_type=pdu.advertiser_address.address_type,
-                    address=pdu.advertiser_address,
+                    address_type=peer_address.address_type,
+                    address=peer_address,
                     primary_phy=hci.Phy.LE_1M,
                     secondary_phy=hci.Phy.LE_1M,
                     advertising_sid=0,
@@ -729,8 +858,8 @@ class Controller:
                 )
                 ext_report = hci.HCI_LE_Extended_Advertising_Report_Event.Report(
                     event_type=hci.HCI_LE_Extended_Advertising_Report_Event.EventType.SCAN_RESPONSE,
-                    address_type=pdu.advertiser_address.address_type,
-                    address=pdu.advertiser_address,
+                    address_type=peer_address.address_type,
+                    address=peer_address,
                     primary_phy=hci.Phy.LE_1M,
                     secondary_phy=hci.Phy.LE_1M,
                     advertising_sid=0,
@@ -749,16 +878,16 @@ class Controller:
             else:
                 report = hci.HCI_LE_Advertising_Report_Event.Report(
                     event_type=hci.HCI_LE_Advertising_Report_Event.EventType.ADV_IND,
-                    address_type=pdu.advertiser_address.address_type,
-                    address=pdu.advertiser_address,
+                    address_type=peer_address.address_type,
+                    address=peer_address,
                     data=pdu.data,
                     rssi=-50,
                 )
                 self.send_hci_packet(hci.HCI_LE_Advertising_Report_Event([report]))
                 report = hci.HCI_LE_Advertising_Report_Event.Report(
                     event_type=hci.HCI_LE_Advertising_Report_Event.EventType.SCAN_RSP,
-                    address_type=pdu.advertiser_address.address_type,
-                    address=pdu.advertiser_address,
+                    address_type=peer_address.address_type,
+                    address=peer_address,
                     data=pdu.data,
                     rssi=-50,
                 )
@@ -767,7 +896,7 @@ class Controller:
         # Create connection.
         if (
             pending_le_connection := self.pending_le_connection
-        ) and pending_le_connection.peer_address == pdu.advertiser_address:
+        ) and pending_le_connection.peer_address == peer_address:
             self.create_le_connection(pdu.advertiser_address)
 
     def on_le_cis_request(
@@ -1984,7 +2113,7 @@ class Controller:
         self.le_scan_type = command.le_scan_type
         self.le_scan_interval = command.le_scan_interval
         self.le_scan_window = command.le_scan_window
-        self.le_scan_own_address_type = hci.AddressType(command.own_address_type)
+        self.le_scan_own_address_type = command.own_address_type
         self.le_scanning_filter_policy = command.scanning_filter_policy
         return bytes([hci.HCI_SUCCESS])
 
@@ -2244,28 +2373,58 @@ class Controller:
         return bytes([hci.HCI_SUCCESS])
 
     def on_hci_le_add_device_to_resolving_list_command(
-        self, _command: hci.HCI_LE_Add_Device_To_Resolving_List_Command
+        self, command: hci.HCI_LE_Add_Device_To_Resolving_List_Command
     ) -> bytes | None:
         '''
         See Bluetooth spec Vol 4, Part E - 7.8.38 LE Add Device To Resolving List
         Command
         '''
+        if self.is_advertising or self.le_scan_enable or self.pending_le_connection:
+            return bytes([hci.HCI_COMMAND_DISALLOWED_ERROR])
+
+        if any(
+            entry.peer_address == command.peer_identity_address
+            for entry in self.resolving_list
+        ):
+            return bytes([hci.HCI_INVALID_HCI_COMMAND_PARAMETERS_ERROR])
+
+        if len(self.resolving_list) >= self.resolving_list_size:
+            return bytes([hci.HCI_MEMORY_CAPACITY_EXCEEDED_ERROR])
+
+        self.rpa_table[command.peer_identity_address] = (
+            hci.Address.generate_private_address(command.local_irk)
+        )
+        self.resolving_list.append(
+            self.ResolvingEntry(
+                peer_irk=command.peer_irk,
+                local_irk=command.local_irk,
+                peer_address=command.peer_identity_address,
+            )
+        )
+
         return bytes([hci.HCI_SUCCESS])
 
     def on_hci_le_clear_resolving_list_command(
-        self, _command: hci.HCI_LE_Clear_Resolving_List_Command
+        self, command: hci.HCI_LE_Clear_Resolving_List_Command
     ) -> bytes | None:
         '''
         See Bluetooth spec Vol 4, Part E - 7.8.40 LE Clear Resolving List Command
         '''
+        del command  # unused.
+
+        if self.is_advertising or self.le_scan_enable or self.pending_le_connection:
+            return bytes([hci.HCI_COMMAND_DISALLOWED_ERROR])
+
+        self.resolving_list.clear()
         return bytes([hci.HCI_SUCCESS])
 
     def on_hci_le_read_resolving_list_size_command(
-        self, _command: hci.HCI_LE_Read_Resolving_List_Size_Command
+        self, command: hci.HCI_LE_Read_Resolving_List_Size_Command
     ) -> bytes | None:
         '''
         See Bluetooth spec Vol 4, Part E - 7.8.41 LE Read Resolving List Size Command
         '''
+        del command  # unused.
         return bytes([hci.HCI_SUCCESS, self.resolving_list_size])
 
     def on_hci_le_set_address_resolution_enable_command(

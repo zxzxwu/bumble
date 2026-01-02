@@ -25,7 +25,6 @@ from bumble.colors import color
 from bumble.device import Advertisement, Device
 from bumble.hci import HCI_LE_1M_PHY, HCI_LE_CODED_PHY, Address, HCI_Constant
 from bumble.keys import JsonKeyStore
-from bumble.smp import AddressResolver
 from bumble.transport import open_transport
 
 
@@ -44,11 +43,11 @@ def make_rssi_bar(rssi):
 
 # -----------------------------------------------------------------------------
 class AdvertisementPrinter:
-    def __init__(self, min_rssi, resolver):
+    def __init__(self, min_rssi, resolving_keys: list[tuple[bytes, Address]]):
         self.min_rssi = min_rssi
-        self.resolver = resolver
+        self.resolving_keys = resolving_keys
 
-    def print_advertisement(self, advertisement):
+    def print_advertisement(self, advertisement: Advertisement):
         address = advertisement.address
         address_color = 'yellow' if advertisement.is_connectable else 'red'
 
@@ -57,8 +56,8 @@ class AdvertisementPrinter:
 
         address_qualifier = ''
         resolution_qualifier = ''
-        if self.resolver and advertisement.address.is_resolvable:
-            resolved = self.resolver.resolve(advertisement.address)
+        if self.resolving_keys and advertisement.address.is_resolvable:
+            resolved = advertisement.address.resolve(self.resolving_keys)
             if resolved is not None:
                 resolution_qualifier = f'(resolved from {advertisement.address})'
                 address = resolved
@@ -105,7 +104,7 @@ class AdvertisementPrinter:
         )
 
         print(
-            f'>>> {color(address, address_color)} '
+            f'>>> {color(str(address), address_color)} '
             f'[{color(address_type_string, type_color)}]{address_qualifier}'
             f'{resolution_qualifier}:{separator}'
             f'{phy_info}'
@@ -123,17 +122,17 @@ class AdvertisementPrinter:
 
 # -----------------------------------------------------------------------------
 async def scan(
-    min_rssi,
-    passive,
-    scan_interval,
-    scan_window,
-    phy,
-    filter_duplicates,
-    raw,
-    irks,
-    keystore_file,
-    device_config,
-    transport,
+    min_rssi: int,
+    passive: bool,
+    scan_interval: int,
+    scan_window: int,
+    phy: str,
+    filter_duplicates: bool,
+    raw: bool,
+    irks: list[str],
+    keystore_file: str,
+    device_config: str,
+    transport: str,
 ):
     print('<<< connecting to HCI...')
     async with await open_transport(transport) as (hci_source, hci_sink):
@@ -145,7 +144,7 @@ async def scan(
             )
         else:
             device = Device.with_hci(
-                'Bumble', 'F0:F1:F2:F3:F4:F5', hci_source, hci_sink
+                'Bumble', Address('F0:F1:F2:F3:F4:F5'), hci_source, hci_sink
             )
 
         await device.power_on()
@@ -169,9 +168,7 @@ async def scan(
                 )
             )
 
-        resolver = AddressResolver(resolving_keys) if resolving_keys else None
-
-        printer = AdvertisementPrinter(min_rssi, resolver)
+        printer = AdvertisementPrinter(min_rssi, resolving_keys)
         if raw:
             device.host.on('advertising_report', printer.on_advertising_report)
         else:
@@ -190,7 +187,7 @@ async def scan(
             scanning_phys=scanning_phys,
         )
 
-        await hci_source.wait_for_termination()
+        await hci_source.terminated
 
 
 # -----------------------------------------------------------------------------
@@ -232,17 +229,17 @@ async def scan(
 )
 @click.argument('transport')
 def main(
-    min_rssi,
-    passive,
-    scan_interval,
-    scan_window,
-    phy,
-    filter_duplicates,
-    raw,
-    irk,
-    keystore_file,
-    device_config,
-    transport,
+    min_rssi: int,
+    passive: bool,
+    scan_interval: int,
+    scan_window: int,
+    phy: str,
+    filter_duplicates: bool,
+    raw: bool,
+    irk: list[str],
+    keystore_file: str,
+    device_config: str,
+    transport: str,
 ):
     bumble.logging.setup_basic_logging('WARNING')
     asyncio.run(

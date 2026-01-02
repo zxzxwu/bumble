@@ -42,6 +42,7 @@ from bumble.core import (
 )
 from bumble.hci import (
     Address,
+    AddressType,
     Fields,
     HCI_LE_Enable_Encryption_Command,
     HCI_Object,
@@ -461,7 +462,7 @@ class SMP_Identity_Address_Information_Command(SMP_Command):
     See Bluetooth spec @ Vol 3, Part H - 3.6.5 Identity Address Information
     '''
 
-    addr_type: int = field(metadata=metadata(Address.ADDRESS_TYPE_SPEC))
+    addr_type: int = field(metadata=AddressType.type_metadata(1))
     bd_addr: Address = field(metadata=metadata(Address.parse_address_preceded_by_type))
 
 
@@ -503,30 +504,6 @@ def smp_auth_req(bonding: bool, mitm: bool, sc: bool, keypress: bool, ct2: bool)
     if ct2:
         value |= SMP_CT2_AUTHREQ
     return value
-
-
-# -----------------------------------------------------------------------------
-class AddressResolver:
-    def __init__(self, resolving_keys):
-        self.resolving_keys = resolving_keys
-
-    def resolve(self, address):
-        address_bytes = bytes(address)
-        hash_part = address_bytes[0:3]
-        prand = address_bytes[3:6]
-        for irk, resolved_address in self.resolving_keys:
-            local_hash = crypto.ah(irk, prand)
-            if local_hash == hash_part:
-                # Match!
-                if resolved_address.address_type == Address.PUBLIC_DEVICE_ADDRESS:
-                    resolved_address_type = Address.PUBLIC_IDENTITY_ADDRESS
-                else:
-                    resolved_address_type = Address.RANDOM_IDENTITY_ADDRESS
-                return Address(
-                    address=str(resolved_address), address_type=resolved_address_type
-                )
-
-        return None
 
 
 # -----------------------------------------------------------------------------

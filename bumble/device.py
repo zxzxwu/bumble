@@ -2261,6 +2261,7 @@ class Device(utils.CompositeEventEmitter):
     big_syncs: dict[int, BigSync]
     _pending_cis: dict[int, tuple[int, int]]
     gatt_service: gatt_service.GenericAttributeProfileService | None = None
+    keystore: KeyStore | None = None
 
     EVENT_ADVERTISEMENT = "advertisement"
     EVENT_PERIODIC_ADVERTISING_SYNC_TRANSFER = "periodic_advertising_sync_transfer"
@@ -2380,7 +2381,7 @@ class Device(utils.CompositeEventEmitter):
         self.big_syncs = {}
         self.classic_enabled = False
         self.inquiry_response = None
-        self.address_resolver = None
+        self.resolving_list: dict[bytes, hci.Address] = {}
         self.classic_pending_accepts = {
             hci.Address.ANY: []
         }  # Futures, by BD address OR [Futures] for hci.Address.ANY
@@ -2395,7 +2396,6 @@ class Device(utils.CompositeEventEmitter):
         self.random_address = config.address
         self.static_address = config.address
         self.class_of_device = config.class_of_device
-        self.keystore = None
         self.irk = config.irk
         self.le_enabled = config.le_enabled
         self.le_simultaneous_enabled = config.le_simultaneous_enabled
@@ -2886,8 +2886,9 @@ class Device(utils.CompositeEventEmitter):
         assert self.keystore is not None
 
         resolving_keys = await self.keystore.get_resolving_keys()
-        # Create a host-side address resolver
-        self.address_resolver = smp.AddressResolver(resolving_keys)
+        self.resolving_list.clear()
+        for irk, address in resolving_keys:
+            self.resolving_list[irk] = address
 
         if self.address_resolution_offload or self.address_generation_offload:
             await self.send_command(
@@ -4352,7 +4353,7 @@ class Device(utils.CompositeEventEmitter):
         # Create a future to wait for an address to be found
         peer_address = asyncio.get_running_loop().create_future()
 
-        def on_peer_found(address, _):
+        def on_peer_found(address: hci.Address) -> None:
             if address == identity_address:
                 if not peer_address.done():
                     logger.debug(f'*** Matching public address found for {address}')
@@ -4360,7 +4361,7 @@ class Device(utils.CompositeEventEmitter):
                 return
 
             if address.is_resolvable:
-                resolved_address = self.address_resolver.resolve(address)
+                resolved_address = address.resolve(self.resolving_list.items())
                 if resolved_address == identity_address:
                     if not peer_address.done():
                         logger.debug(f'*** Matching identity found for {address}')
@@ -4368,16 +4369,12 @@ class Device(utils.CompositeEventEmitter):
                 return
 
         was_scanning = self.scanning
-        event_name = 'advertisement'
-        listener = None
+        event_name = self.EVENT_ADVERTISEMENT
+        listener = self.on(
+            event_name,
+            lambda advertisement: on_peer_found(advertisement.address),
+        )
         try:
-            listener = self.on(
-                event_name,
-                lambda advertisement: on_peer_found(
-                    advertisement.address, advertisement.data
-                ),
-            )
-
             if not self.scanning:
                 await self.start_scanning(filter_duplicates=True)
 
@@ -4515,8 +4512,8 @@ class Device(utils.CompositeEventEmitter):
                     ediv = 0
                 elif keys.ltk_central is not None:
                     ltk = keys.ltk_central.value
-                    rand = keys.ltk_central.rand
-                    ediv = keys.ltk_central.ediv
+                    rand = keys.ltk_central.rand or b''
+                    ediv = keys.ltk_central.ediv or 0
                 else:
                     raise InvalidOperationError('no LTK found for peer')
 
@@ -5458,13 +5455,12 @@ class Device(utils.CompositeEventEmitter):
 
         if peer_resolvable_address is None:
             # Resolve the peer address if we can
-            if self.address_resolver:
-                if peer_address.is_resolvable:
-                    resolved_address = self.address_resolver.resolve(peer_address)
-                    if resolved_address is not None:
-                        logger.debug(f'*** hci.Address resolved as {resolved_address}')
-                        peer_resolvable_address = peer_address
-                        peer_address = resolved_address
+            if peer_address.is_resolvable:
+                resolved_address = peer_address.resolve(self.resolving_list.items())
+                if resolved_address is not None:
+                    logger.debug(f'*** hci.Address resolved as {resolved_address}')
+                    peer_resolvable_address = peer_address
+                    peer_address = resolved_address
 
         self_address = None
         own_address_type: hci.OwnAddressType | None = None
