@@ -1991,8 +1991,7 @@ class ClassicChannelServer(utils.EventEmitter):
             self.handler(channel)
 
     def close(self) -> None:
-        if self.psm in self.manager.servers:
-            del self.manager.servers[self.psm]
+        self.manager.servers.pop(self.psm, None)
 
 
 # -----------------------------------------------------------------------------
@@ -2022,8 +2021,7 @@ class LeCreditBasedChannelServer(utils.EventEmitter):
             self.handler(channel)
 
     def close(self) -> None:
-        if self.psm in self.manager.le_coc_servers:
-            del self.manager.le_coc_servers[self.psm]
+        self.manager.le_coc_servers.pop(self.psm, None)
 
 
 # -----------------------------------------------------------------------------
@@ -2146,8 +2144,7 @@ class ChannelManager:
         self.fixed_channels[cid] = handler
 
     def deregister_fixed_channel(self, cid: int) -> None:
-        if cid in self.fixed_channels:
-            del self.fixed_channels[cid]
+        self.fixed_channels.pop(cid, None)
 
     def create_classic_server(
         self,
@@ -2877,8 +2874,7 @@ class ChannelManager:
     def on_channel_closed(self, channel: ClassicChannel) -> None:
         connection_channels = self.channels.get(channel.connection.handle)
         if connection_channels:
-            if channel.source_cid in connection_channels:
-                del connection_channels[channel.source_cid]
+            connection_channels.pop(channel.source_cid, None)
 
     async def create_le_credit_based_channel(
         self,

@@ -2026,8 +2026,7 @@ class Manager(utils.EventEmitter):
 
     def on_session_end(self, session: Session) -> None:
         logger.debug(f'session end for connection 0x{session.connection.handle:04X}')
-        if session.connection.handle in self.sessions:
-            del self.sessions[session.connection.handle]
+        self.sessions.pop(session.connection.handle, None)
 
     def get_long_term_key(
         self, connection: Connection, rand: bytes, ediv: int

@@ -364,8 +364,7 @@ class MemoryKeyStore(KeyStore):
         self.all_keys = {}
 
     async def delete(self, name: str) -> None:
-        if name in self.all_keys:
-            del self.all_keys[name]
+        self.all_keys.pop(name, None)
 
     async def update(self, name: str, keys: PairingKeys) -> None:
         self.all_keys[name] = keys

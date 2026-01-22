@@ -1768,8 +1768,7 @@ class Listener(utils.EventEmitter):
         self.servers[connection.handle] = server
 
     def remove_server(self, connection: device.Connection) -> None:
-        if connection.handle in self.servers:
-            del self.servers[connection.handle]
+        self.servers.pop(connection.handle, None)
 
     def __init__(self, registrar=None, version=(1, 3)):
         super().__init__()

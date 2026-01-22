@@ -1908,7 +1908,8 @@ class Protocol(utils.EventEmitter):
 
     def notify_event(self, event: Event):
         """Notify an event to the connected peer."""
-        if (listener := self.notification_listeners.get(event.event_id)) is None:
+        # Remove the listener (they will need to re-register).
+        if not (listener := self.notification_listeners.pop(event.event_id, None)):
             logger.debug(f"no listener for {event.event_id.name}")
             return
 
@@ -1919,9 +1920,6 @@ class Protocol(utils.EventEmitter):
             avc.ResponseFrame.ResponseCode.CHANGED,
             notification,
         )
-
-        # Remove the listener (they will need to re-register).
-        del self.notification_listeners[event.event_id]
 
     def notify_playback_status_changed(self, status: PlayStatus) -> None:
         """Notify the connected peer of a Playback Status change."""

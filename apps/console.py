@@ -382,7 +382,7 @@ class ConsoleApp:
 
     def show_remote_services(self, services):
         lines = []
-        del self.known_remote_attributes[:]
+        self.known_remote_attributes.clear()
         for service in services:
             lines.append(("ansicyan", f"{service}\n"))
 
@@ -403,7 +403,7 @@ class ConsoleApp:
 
     def show_local_services(self, attributes):
         lines = []
-        del self.known_local_attributes[:]
+        self.known_local_attributes.clear()
         for attribute in attributes:
             if isinstance(attribute, Service):
                 # Save the most recent service for use later

@@ -219,12 +219,11 @@ class PacketTracer:
             return stream
 
         def end_acl_stream(self, connection_handle: int) -> None:
-            if connection_handle in self.acl_streams:
+            if self.acl_streams.pop(connection_handle, None):
                 logger.info(
                     f'[{self.label}] --- Removing ACL stream for connection '
                     f'0x{connection_handle:04X}'
                 )
-                del self.acl_streams[connection_handle]
 
                 # Let the other forwarder know so it can cleanup its stream as well
                 self.peer.end_acl_stream(connection_handle)
