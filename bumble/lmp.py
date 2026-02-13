@@ -322,3 +322,11 @@ class LmpNameRes(Packet):
     name_offset: int = field(metadata=hci.metadata(2))
     name_length: int = field(metadata=hci.metadata(3))
     name_fregment: bytes = field(metadata=hci.metadata('*'))
+
+
+@Packet.subclass
+@dataclass
+class LmpSres(Packet):
+    opcode = Opcode.LMP_SRES
+
+    authentication_response: bytes = field(metadata=hci.metadata(4))
