@@ -51,6 +51,7 @@ from bumble.hci import (
     Role,
 )
 from bumble.host import DataPacketQueue, Host
+from bumble.keys import PairingKeys
 
 from .test_utils import TwoDevices, async_barrier
 
@@ -822,6 +823,59 @@ async def test_remote_name_request():
     await devices[1].power_on()
     actual_name = await devices[0].request_remote_name(devices[1].public_address)
     assert actual_name == expected_name
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "responder_has_key, keys_match, expected_error",
+    [
+        (True, True, None),
+        (True, False, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR),
+        (False, None, hci.HCI_ErrorCode.PIN_OR_KEY_MISSING_ERROR),
+    ],
+)
+@pytest.mark.asyncio
+async def test_classic_link_key_authentication(
+    responder_has_key, keys_match, expected_error
+):
+    devices = TwoDevices()
+
+    # Enable Classic
+    devices[0].classic_enabled = True
+    devices[1].classic_enabled = True
+
+    await devices[0].power_on()
+    await devices[1].power_on()
+
+    # Connect
+    connection0, _ = await asyncio.gather(
+        devices[0].connect(
+            devices[1].public_address, transport=PhysicalTransport.BR_EDR
+        ),
+        devices[1].accept(role=hci.Role.PERIPHERAL),
+    )
+
+    link_key = bytes.fromhex('00112233445566778899AABBCCDDEEFF')
+    wrong_key = bytes.fromhex('FF112233445566778899AABBCCDDEEFF')
+
+    # Initiator always has the key
+    await devices[0].keystore.update(
+        str(devices[1].public_address), PairingKeys(link_key=PairingKeys.Key(link_key))
+    )
+
+    if responder_has_key:
+        responder_key = link_key if keys_match else wrong_key
+        await devices[1].keystore.update(
+            str(devices[0].public_address),
+            PairingKeys(link_key=PairingKeys.Key(responder_key)),
+        )
+
+    if expected_error:
+        with pytest.raises(hci.HCI_Error) as excinfo:
+            await connection0.authenticate()
+        assert excinfo.value.error_code == expected_error
+    else:
+        await connection0.authenticate()
 
 
 # -----------------------------------------------------------------------------

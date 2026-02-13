@@ -18,10 +18,13 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
+import hashlib
 import itertools
 import logging
 import random
+import secrets
 import struct
 from typing import TYPE_CHECKING, Any, cast
 
@@ -326,6 +329,17 @@ class Controller:
             'tx_phys': 0,
             'rx_phys': 0,
         }
+        self._reveived_lmp_packets: collections.defaultdict[
+            hci.Address, asyncio.Queue[lmp.Packet]
+        ] = collections.defaultdict(asyncio.Queue)
+        self._expected_hci_commands: collections.defaultdict[
+            hci.Address, collections.defaultdict[int, asyncio.Future[hci.HCI_Command]]
+        ] = collections.defaultdict(
+            lambda: collections.defaultdict(
+                lambda: asyncio.get_running_loop().create_future()
+            )
+        )
+
         self.le_legacy_advertiser = LegacyAdvertiser(self)
 
         if isinstance(public_address, hci.Address):
@@ -899,31 +913,13 @@ class Controller:
 
     def send_lmp_packet(
         self, receiver_address: hci.Address, packet: lmp.Packet
-    ) -> asyncio.Future[int]:
-        loop = asyncio.get_running_loop()
+    ) -> None:
         assert self.link
         self.link.send_lmp_packet(self, receiver_address, packet)
-        future = self.classic_pending_commands.setdefault(receiver_address, {})[
-            packet.opcode
-        ] = loop.create_future()
-        return future
 
     def on_lmp_packet(self, sender_address: hci.Address, packet: lmp.Packet) -> None:
+        connection = self.classic_connections.get(sender_address)
         match packet:
-            case lmp.LmpAccepted() | lmp.LmpAcceptedExt():
-                if future := self.classic_pending_commands.setdefault(
-                    sender_address, {}
-                ).get(packet.response_opcode):
-                    future.set_result(hci.HCI_ErrorCode.SUCCESS)
-                else:
-                    logger.error("!!! Unhandled packet: %s", packet)
-            case lmp.LmpNotAccepted() | lmp.LmpNotAcceptedExt():
-                if future := self.classic_pending_commands.setdefault(
-                    sender_address, {}
-                ).get(packet.response_opcode):
-                    future.set_result(packet.error_code)
-                else:
-                    logger.error("!!! Unhandled packet: %s", packet)
             case lmp.LmpHostConnectionReq():
                 self.on_classic_connection_request(
                     sender_address, hci.HCI_Connection_Complete_Event.LinkType.ACL
@@ -954,8 +950,13 @@ class Controller:
                     packet.name_length,
                     packet.name_fregment,
                 )
+            case lmp.LmpAuRand():
+                assert connection
+                asyncio.create_task(
+                    self.respond_classic_authentication(connection, packet)
+                )
             case _:
-                logger.error("!!! Unhandled packet: %s", packet)
+                self._reveived_lmp_packets[sender_address].put_nowait(packet)
 
     def on_classic_connection_request(
         self, peer_address: hci.Address, link_type: int
@@ -1020,7 +1021,7 @@ class Controller:
                 )
             )
         else:
-            connection = None
+            self.classic_connections.pop(peer_address, None)
             self.send_hci_packet(
                 hci.HCI_Connection_Complete_Event(
                     status=status,
@@ -1149,6 +1150,89 @@ class Controller:
             )
         )
 
+    def _calculate_sres(
+        self, bd_addr: hci.Address, rand: bytes, link_key: bytes
+    ) -> bytes:
+        # Placeholder: E1 algorithm should be here
+        m = hashlib.sha256()
+        m.update(link_key)
+        m.update(rand)
+        m.update(bytes(bd_addr))
+        return m.digest()[:4]
+
+    async def respond_classic_authentication(
+        self, connection: Connection, request: lmp.LmpAuRand
+    ) -> None:
+        self.send_hci_packet(
+            hci.HCI_Link_Key_Request_Event(bd_addr=connection.peer_address)
+        )
+        link_key_result = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_LINK_KEY_REQUEST_REPLY_COMMAND
+        ] = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_LINK_KEY_REQUEST_NEGATIVE_REPLY_COMMAND
+        ]
+
+        link_key_response = await link_key_result
+        match link_key_response:
+            case hci.HCI_Link_Key_Request_Reply_Command():
+                response: lmp.Packet = lmp.LmpSres(
+                    authentication_response=self._calculate_sres(
+                        connection.self_address,
+                        rand=request.random_number,
+                        link_key=link_key_response.link_key,
+                    )
+                )
+            case hci.HCI_Link_Key_Request_Negative_Reply_Command() | _:
+                response = lmp.LmpNotAccepted(
+                    response_opcode=lmp.Opcode.LMP_AU_RAND,
+                    error_code=hci.HCI_ErrorCode.PIN_OR_KEY_MISSING_ERROR,
+                )
+        self.send_lmp_packet(connection.peer_address, response)
+
+    async def initiate_classic_authentication(self, connection: Connection) -> None:
+        self.send_hci_packet(
+            hci.HCI_Link_Key_Request_Event(bd_addr=connection.peer_address)
+        )
+        link_key_result = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_LINK_KEY_REQUEST_REPLY_COMMAND
+        ] = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_LINK_KEY_REQUEST_NEGATIVE_REPLY_COMMAND
+        ]
+
+        link_key_response = await link_key_result
+        match link_key_response:
+            case hci.HCI_Link_Key_Request_Reply_Command():
+                link_key = link_key_response.link_key
+            case hci.HCI_Link_Key_Request_Negative_Reply_Command() | _:
+                # TODO: Start SSP or Legacy Pairing
+                self.send_hci_packet(
+                    hci.HCI_Authentication_Complete_Event(
+                        status=hci.HCI_ErrorCode.PIN_OR_KEY_MISSING_ERROR,
+                        connection_handle=connection.handle,
+                    )
+                )
+                return
+
+        rand = secrets.token_bytes(16)
+        self.send_lmp_packet(connection.peer_address, lmp.LmpAuRand(rand))
+        auth_response = await self._reveived_lmp_packets[connection.peer_address].get()
+        match auth_response:
+            case lmp.LmpSres(actual_sres):
+                if (
+                    self._calculate_sres(connection.peer_address, rand, link_key)
+                    != actual_sres
+                ):
+                    status: int = hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+                else:
+                    status = hci.HCI_ErrorCode.SUCCESS
+            case lmp.LmpNotAccepted(error_code=error_code):
+                status = error_code
+        self.send_hci_packet(
+            hci.HCI_Authentication_Complete_Event(
+                status=status, connection_handle=connection.handle
+            )
+        )
+
     ############################################################
     # Advertising support
     ############################################################
@@ -1202,13 +1286,75 @@ class Controller:
 
         # Say that the connection is pending
         self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
-        future = self.send_lmp_packet(command.bd_addr, lmp.LmpHostConnectionReq())
+        self.send_lmp_packet(command.bd_addr, lmp.LmpHostConnectionReq())
 
-        def on_response(future: asyncio.Future[int]) -> None:
-            self.on_classic_connection_complete(command.bd_addr, future.result())
+        def on_response(future: asyncio.Future[lmp.Packet]) -> None:
+            match (response := future.result()):
+                case lmp.LmpAccepted():
+                    status: int = hci.HCI_ErrorCode.SUCCESS
+                case lmp.LmpNotAccepted():
+                    status = response.error_code
+            self.on_classic_connection_complete(command.bd_addr, status)
 
-        future.add_done_callback(on_response)
-        return None
+        asyncio.ensure_future(
+            self._reveived_lmp_packets[command.bd_addr].get()
+        ).add_done_callback(on_response)
+
+    def on_hci_link_key_request_reply_command(
+        self, command: hci.HCI_Link_Key_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.10 Link Key Request Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_link_key_request_negative_reply_command(
+        self, command: hci.HCI_Link_Key_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.11 Link Key Request Negative Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_authentication_requested_command(
+        self, command: hci.HCI_Authentication_Requested_Command
+    ) -> None:
+        # See Bluetooth spec Vol 4, Part E - 7.1.15 Authentication Requested Command
+        self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
+
+        if (
+            connection := self.find_classic_connection_by_handle(
+                command.connection_handle
+            )
+        ) is None:
+            self._send_hci_command_status(
+                hci.HCI_UNKNOWN_CONNECTION_IDENTIFIER_ERROR, command.op_code
+            )
+            return
+
+        self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
+
+        asyncio.create_task(self.initiate_classic_authentication(connection))
 
     def on_hci_disconnect_command(self, command: hci.HCI_Disconnect_Command) -> None:
         '''
@@ -1292,25 +1438,32 @@ class Controller:
 
         if command.role == hci.Role.CENTRAL:
             # Perform role switching before accept.
-            future = self.send_lmp_packet(command.bd_addr, lmp.LmpSwitchReq())
+            self.send_lmp_packet(command.bd_addr, lmp.LmpSwitchReq())
 
-            def on_response(future: asyncio.Future[int]) -> None:
-                if (status := future.result()) == hci.HCI_ErrorCode.SUCCESS:
-                    self.classic_role_change(connection)
-                    # Continue connection setup.
-                    self.send_lmp_packet(
-                        command.bd_addr,
-                        lmp.LmpAccepted(lmp.Opcode.LMP_HOST_CONNECTION_REQ),
-                    )
-                else:
-                    # Abort connection setup.
-                    self.send_lmp_packet(
-                        command.bd_addr,
-                        lmp.LmpNotAccepted(lmp.Opcode.LMP_HOST_CONNECTION_REQ, status),
-                    )
+            def on_response(future: asyncio.Future[lmp.Packet]) -> None:
+                match (response := future.result()):
+                    case lmp.LmpAccepted():
+                        self.classic_role_change(connection)
+                        # Continue connection setup.
+                        self.send_lmp_packet(
+                            command.bd_addr,
+                            lmp.LmpAccepted(lmp.Opcode.LMP_HOST_CONNECTION_REQ),
+                        )
+                        status: int = hci.HCI_ErrorCode.SUCCESS
+                    case lmp.LmpNotAccepted():
+                        # Abort connection setup.
+                        status = response.error_code
+                        self.send_lmp_packet(
+                            command.bd_addr,
+                            lmp.LmpNotAccepted(
+                                lmp.Opcode.LMP_HOST_CONNECTION_REQ, status
+                            ),
+                        )
                 self.on_classic_connection_complete(command.bd_addr, status)
 
-            future.add_done_callback(on_response)
+            asyncio.ensure_future(
+                self._reveived_lmp_packets[command.bd_addr].get()
+            ).add_done_callback(on_response)
 
         else:
             # Simply accept connection.
@@ -1354,7 +1507,7 @@ class Controller:
             return None
 
         self._send_hci_command_status(hci.HCI_ErrorCode.SUCCESS, command.op_code)
-        future = self.send_lmp_packet(
+        self.send_lmp_packet(
             connection.peer_address,
             lmp.LmpEscoLinkReq(
                 esco_handle=0,
@@ -1372,14 +1525,21 @@ class Controller:
             ),
         )
 
-        def on_response(future: asyncio.Future[int]) -> None:
+        def on_response(future: asyncio.Future[lmp.Packet]) -> None:
+            match (response := future.result()):
+                case lmp.LmpAccepted() | lmp.LmpAcceptedExt():
+                    status: int = hci.HCI_ErrorCode.SUCCESS
+                case lmp.LmpNotAccepted() | lmp.LmpNotAcceptedExt():
+                    status = response.error_code
             self.on_classic_sco_connection_complete(
                 connection.peer_address,
-                future.result(),
+                status,
                 hci.HCI_Connection_Complete_Event.LinkType.ESCO,
             )
 
-        future.add_done_callback(on_response)
+        asyncio.ensure_future(
+            self._reveived_lmp_packets[connection.peer_address].get()
+        ).add_done_callback(on_response)
         return None
 
     def on_hci_enhanced_accept_synchronous_connection_request_command(
@@ -1483,11 +1643,15 @@ class Controller:
                 )
             )
         else:
-            future = self.send_lmp_packet(command.bd_addr, lmp.LmpSwitchReq())
+            self.send_lmp_packet(command.bd_addr, lmp.LmpSwitchReq())
 
-            def on_response(future: asyncio.Future[int]) -> None:
-                if (status := future.result()) == hci.HCI_ErrorCode.SUCCESS:
-                    connection.role = hci.Role(command.role)
+            def on_response(future: asyncio.Future[lmp.Packet]) -> None:
+                match (response := future.result()):
+                    case lmp.LmpAccepted():
+                        connection.role = hci.Role(command.role)
+                        status: int = hci.HCI_ErrorCode.SUCCESS
+                    case lmp.LmpNotAccepted():
+                        status = response.error_code
                 self.send_hci_packet(
                     hci.HCI_Role_Change_Event(
                         status=status,
@@ -1496,7 +1660,9 @@ class Controller:
                     )
                 )
 
-            future.add_done_callback(on_response)
+            asyncio.ensure_future(
+                self._reveived_lmp_packets[command.bd_addr].get()
+            ).add_done_callback(on_response)
 
         return None
 
