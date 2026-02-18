@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import dataclasses
+import enum
 import hashlib
 import itertools
 import logging
@@ -28,7 +29,7 @@ import secrets
 import struct
 from typing import TYPE_CHECKING, Any, cast
 
-from bumble import hci, link, ll, lmp
+from bumble import hci, link, ll, lmp, crypto
 from bumble import link as bumble_link
 from bumble.colors import color
 from bumble.core import PhysicalTransport
@@ -47,6 +48,14 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 class DataObject:
     pass
+
+
+class AuthenticationMethod(enum.IntEnum):
+    JUST_WORKS = 0
+    PASSKEY_REQUEST = 1
+    NUMERIC_COMPARISON = 2
+    OUT_OF_BAND = 3
+    PASSKEY_NOTIFICATION = 4
 
 
 # -----------------------------------------------------------------------------
@@ -955,6 +964,9 @@ class Controller:
                 asyncio.create_task(
                     self.respond_classic_authentication(connection, packet)
                 )
+            case lmp.LmpIoCapabilityReq():
+                assert connection
+                asyncio.create_task(self.ssp_responder(connection, packet))
             case _:
                 self._reveived_lmp_packets[sender_address].put_nowait(packet)
 
@@ -1204,13 +1216,7 @@ class Controller:
             case hci.HCI_Link_Key_Request_Reply_Command():
                 link_key = link_key_response.link_key
             case hci.HCI_Link_Key_Request_Negative_Reply_Command() | _:
-                # TODO: Start SSP or Legacy Pairing
-                self.send_hci_packet(
-                    hci.HCI_Authentication_Complete_Event(
-                        status=hci.HCI_ErrorCode.PIN_OR_KEY_MISSING_ERROR,
-                        connection_handle=connection.handle,
-                    )
-                )
+                await self.ssp_initiator(connection)
                 return
 
         rand = secrets.token_bytes(16)
@@ -1232,6 +1238,477 @@ class Controller:
                 status=status, connection_handle=connection.handle
             )
         )
+
+    async def ssp_initiator(self, connection: Connection) -> None:
+        # IO Capability Exchange
+        self.send_hci_packet(
+            hci.HCI_IO_Capability_Request_Event(bd_addr=connection.peer_address)
+        )
+        io_capability_result = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_IO_CAPABILITY_REQUEST_REPLY_COMMAND
+        ] = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY_COMMAND
+        ]
+
+        io_capability_response = await io_capability_result
+        match io_capability_response:
+            case hci.HCI_IO_Capability_Request_Reply_Command():
+                local_io_capability = io_capability_response.io_capability
+                local_oob_data_present = io_capability_response.oob_data_present
+                local_auth_requirements = (
+                    io_capability_response.authentication_requirements
+                )
+            case hci.HCI_IO_Capability_Request_Negative_Reply_Command() | _:
+                self.send_lmp_packet(
+                    connection.peer_address,
+                    lmp.LmpNotAccepted(
+                        response_opcode=lmp.Opcode.LMP_IO_CAPABILITY_REQ,
+                        error_code=hci.HCI_ErrorCode.OPERATION_CANCELLED_BY_HOST_ERROR,
+                    ),
+                )
+                self.send_hci_packet(
+                    hci.HCI_Authentication_Complete_Event(
+                        status=hci.HCI_ErrorCode.OPERATION_CANCELLED_BY_HOST_ERROR,
+                        connection_handle=connection.handle,
+                    )
+                )
+                return
+
+        self.send_lmp_packet(
+            connection.peer_address,
+            lmp.LmpIoCapabilityReq(
+                io_capability=local_io_capability,
+                oob_data_present=local_oob_data_present,
+                authentication_requirements=local_auth_requirements,
+            ),
+        )
+
+        io_cap_res = await self._reveived_lmp_packets[connection.peer_address].get()
+        match io_cap_res:
+            case lmp.LmpIoCapabilityRes(
+                io_capability=remote_io_capability,
+                oob_data_present=remote_oob_data_present,
+                authentication_requirements=remote_authentication_requirements,
+            ):
+                pass
+            case lmp.LmpNotAccepted() | _:
+                self._ssp_complete(
+                    connection=connection,
+                    status=hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR,
+                    is_initiator=True,
+                )
+                return
+
+        self.send_hci_packet(
+            hci.HCI_IO_Capability_Response_Event(
+                bd_addr=connection.peer_address,
+                io_capability=remote_io_capability,
+                oob_data_present=remote_oob_data_present,
+                authentication_requirements=remote_authentication_requirements,
+            )
+        )
+
+        authentication_method = self._determine_authentication_method(
+            local_io_capability=local_io_capability,
+            local_auth_requirements=local_auth_requirements,
+            local_oob_data_present=local_oob_data_present,
+            remote_io_capability=remote_io_capability,
+            remote_auth_requirements=remote_authentication_requirements,
+            remote_oob_data_present=remote_oob_data_present,
+        )
+
+        # Public Key Exchange
+        local_private_key = crypto.EccKey.generate()
+        await self._send_public_key(connection, local_private_key)
+        remote_public_key = await self._receive_public_key(connection)
+        remote_public_key_x = remote_public_key[:32]
+        remote_public_key_y = remote_public_key[32:]
+        dh_key = local_private_key.dh(remote_public_key_x, remote_public_key_y)
+        local_nonce = secrets.token_bytes(16)
+
+        status = hci.HCI_ErrorCode.SUCCESS
+        match authentication_method:
+            case (
+                AuthenticationMethod.JUST_WORKS
+                | AuthenticationMethod.NUMERIC_COMPARISON
+            ):
+                # Simple Pairing Confirm
+                await self._reveived_lmp_packets[connection.peer_address].get()
+                self.send_lmp_packet(
+                    connection.peer_address,
+                    lmp.LmpSimplePairingNumber(local_nonce),
+                )
+                # Accepted(Simple Pairing Number)
+                await self._reveived_lmp_packets[connection.peer_address].get()
+                match remote_simple_pairing_number := (
+                    await self._reveived_lmp_packets[connection.peer_address].get()
+                ):
+                    case lmp.LmpSimplePairingNumber(remote_nonce):
+                        self.send_lmp_packet(
+                            connection.peer_address,
+                            lmp.LmpAccepted(remote_simple_pairing_number.opcode),
+                        )
+
+                # User confirmation
+                self.send_hci_packet(
+                    hci.HCI_User_Confirmation_Request_Event(
+                        bd_addr=connection.peer_address,
+                        numeric_value=int.from_bytes(
+                            crypto.g(
+                                local_private_key.x,
+                                remote_public_key_x,
+                                local_nonce,
+                                remote_nonce,
+                            )
+                        )
+                        % 1000000,
+                    )
+                )
+                user_confirmation_result = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_CONFIRMATION_REQUEST_REPLY_COMMAND
+                ] = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY_COMMAND
+                ]
+                match await user_confirmation_result:
+                    case hci.HCI_User_Confirmation_Request_Reply_Command():
+                        pass
+                    case hci.HCI_User_Confirmation_Request_Negative_Reply_Command():
+                        status = hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+            case AuthenticationMethod.PASSKEY_REQUEST:
+                self.send_hci_packet(
+                    hci.HCI_User_Passkey_Request_Event(bd_addr=connection.peer_address)
+                )
+                user_confirmation_result = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_PASSKEY_REQUEST_REPLY_COMMAND
+                ] = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_PASSKEY_REQUEST_NEGATIVE_REPLY_COMMAND
+                ]
+                match await user_confirmation_result:
+                    case hci.HCI_User_Passkey_Request_Reply_Command():
+                        pass
+                    case hci.HCI_User_Passkey_Request_Negative_Reply_Command():
+                        status = hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+                # TODO: Send Simple Pairing Confirm + Number
+            case AuthenticationMethod.PASSKEY_NOTIFICATION:
+                self.send_hci_packet(
+                    hci.HCI_User_Passkey_Notification_Event(
+                        bd_addr=connection.peer_address, passkey=123456
+                    )
+                )
+                # TODO: Send Simple Pairing Confirm + Number
+
+        # TODO: DH Key Check
+        match authentication_method:
+            case AuthenticationMethod.JUST_WORKS:
+                link_key_type = (
+                    hci.LinkKeyType.UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P_192
+                )
+            case _:
+                link_key_type = (
+                    hci.LinkKeyType.AUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P_192
+                )
+
+        self._ssp_complete(
+            connection=connection,
+            status=status,
+            link_key=dh_key,
+            link_key_type=link_key_type,
+            is_initiator=True,
+        )
+
+    async def ssp_responder(
+        self, connection: Connection, request: lmp.LmpIoCapabilityReq
+    ) -> None:
+        # IO Capability Exchange
+        self.send_hci_packet(
+            hci.HCI_IO_Capability_Response_Event(
+                bd_addr=connection.peer_address,
+                io_capability=request.io_capability,
+                oob_data_present=request.oob_data_present,
+                authentication_requirements=request.authentication_requirements,
+            )
+        )
+        self.send_hci_packet(
+            hci.HCI_IO_Capability_Request_Event(bd_addr=connection.peer_address)
+        )
+        io_capability_result = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_IO_CAPABILITY_REQUEST_REPLY_COMMAND
+        ] = self._expected_hci_commands[connection.peer_address][
+            hci.HCI_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY_COMMAND
+        ]
+
+        io_capability_response = await io_capability_result
+        match io_capability_response:
+            case hci.HCI_IO_Capability_Request_Reply_Command():
+                local_io_capability = io_capability_response.io_capability
+                local_oob_data_present = io_capability_response.oob_data_present
+                local_auth_requirements = (
+                    io_capability_response.authentication_requirements
+                )
+            case hci.HCI_IO_Capability_Request_Negative_Reply_Command() | _:
+                self.send_lmp_packet(
+                    connection.peer_address,
+                    lmp.LmpNotAccepted(
+                        response_opcode=lmp.Opcode.LMP_IO_CAPABILITY_REQ,
+                        error_code=hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR,
+                    ),
+                )
+                self._ssp_complete(
+                    connection=connection,
+                    status=hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR,
+                    is_initiator=False,
+                )
+                return
+
+        self.send_lmp_packet(
+            connection.peer_address,
+            lmp.LmpIoCapabilityRes(
+                io_capability=local_io_capability,
+                oob_data_present=local_oob_data_present,
+                authentication_requirements=local_auth_requirements,
+            ),
+        )
+
+        authentication_method = self._determine_authentication_method(
+            local_io_capability=local_io_capability,
+            local_auth_requirements=local_auth_requirements,
+            local_oob_data_present=local_oob_data_present,
+            remote_io_capability=request.io_capability,
+            remote_auth_requirements=request.authentication_requirements,
+            remote_oob_data_present=request.oob_data_present,
+        )
+
+        # Public Key Exchange
+        remote_public_key = await self._receive_public_key(connection)
+        remote_public_key_x = remote_public_key[:32]
+        remote_public_key_y = remote_public_key[32:]
+        local_private_key = crypto.EccKey.generate()
+        local_nonce = secrets.token_bytes(16)
+        await self._send_public_key(connection, local_private_key)
+        dh_key = local_private_key.dh(remote_public_key_x, remote_public_key_y)
+
+        status = hci.HCI_ErrorCode.SUCCESS
+        match authentication_method:
+            case (
+                AuthenticationMethod.JUST_WORKS
+                | AuthenticationMethod.NUMERIC_COMPARISON
+            ):
+                # TODO: Send Simple Pairing Confirm + Number
+                self.send_lmp_packet(
+                    connection.peer_address,
+                    lmp.LmpSimplePairingConfirm(
+                        crypto.f1(
+                            local_private_key.x,
+                            remote_public_key_x,
+                            local_nonce,
+                            bytes([0]),
+                        )
+                    ),
+                )
+                match remote_simple_pairing_number := (
+                    await self._reveived_lmp_packets[connection.peer_address].get()
+                ):
+                    case lmp.LmpSimplePairingNumber(remote_nonce):
+                        self.send_lmp_packet(
+                            connection.peer_address,
+                            lmp.LmpAccepted(remote_simple_pairing_number.opcode),
+                        )
+                self.send_lmp_packet(
+                    connection.peer_address,
+                    lmp.LmpSimplePairingNumber(local_nonce),
+                )
+                await self._reveived_lmp_packets[connection.peer_address].get()
+
+                self.send_hci_packet(
+                    hci.HCI_User_Confirmation_Request_Event(
+                        bd_addr=connection.peer_address,
+                        numeric_value=int.from_bytes(
+                            crypto.g(
+                                remote_public_key_x,
+                                local_private_key.x,
+                                remote_nonce,
+                                local_nonce,
+                            )
+                        )
+                        % 1000000,
+                    )
+                )
+                user_confirmation_result = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_CONFIRMATION_REQUEST_REPLY_COMMAND
+                ] = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY_COMMAND
+                ]
+                match await user_confirmation_result:
+                    case hci.HCI_User_Confirmation_Request_Reply_Command():
+                        pass
+                    case hci.HCI_User_Confirmation_Request_Negative_Reply_Command():
+                        status = hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+            case AuthenticationMethod.PASSKEY_REQUEST:
+                self.send_hci_packet(
+                    hci.HCI_User_Passkey_Request_Event(bd_addr=connection.peer_address)
+                )
+                user_confirmation_result = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_PASSKEY_REQUEST_REPLY_COMMAND
+                ] = self._expected_hci_commands[
+                    connection.peer_address
+                ][
+                    hci.HCI_USER_PASSKEY_REQUEST_NEGATIVE_REPLY_COMMAND
+                ]
+                match await user_confirmation_result:
+                    case hci.HCI_User_Passkey_Request_Reply_Command():
+                        pass
+                    case hci.HCI_User_Passkey_Request_Negative_Reply_Command():
+                        pass
+                        status = hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+                # TODO: Simple Pairing Confirm + Number
+            case AuthenticationMethod.PASSKEY_NOTIFICATION:
+                self.send_hci_packet(
+                    hci.HCI_User_Passkey_Notification_Event(
+                        bd_addr=connection.peer_address, passkey=123456
+                    )
+                )
+                # TODO: Send Simple Pairing Confirm + Number
+
+        # TODO: DH Key Check
+
+        match authentication_method:
+            case AuthenticationMethod.JUST_WORKS:
+                link_key_type = (
+                    hci.LinkKeyType.UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P_192
+                )
+            case _:
+                link_key_type = (
+                    hci.LinkKeyType.AUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P_192
+                )
+        self._ssp_complete(
+            connection=connection,
+            status=status,
+            link_key=dh_key,
+            link_key_type=link_key_type,
+            is_initiator=False,
+        )
+
+    def _ssp_complete(
+        self,
+        connection: Connection,
+        status: int,
+        is_initiator: bool,
+        link_key: bytes = b'',
+        link_key_type: int = 0,
+    ) -> None:
+        self.send_hci_packet(
+            hci.HCI_Simple_Pairing_Complete_Event(
+                status=status, bd_addr=connection.peer_address
+            )
+        )
+        if is_initiator:
+            self.send_hci_packet(
+                hci.HCI_Authentication_Complete_Event(
+                    status=status, connection_handle=connection.handle
+                )
+            )
+        if status == hci.HCI_ErrorCode.SUCCESS:
+            self.send_hci_packet(
+                hci.HCI_Link_Key_Notification_Event(
+                    bd_addr=connection.peer_address,
+                    link_key=link_key,
+                    key_type=link_key_type,
+                )
+            )
+
+    def _determine_authentication_method(
+        self,
+        local_io_capability: int,
+        local_auth_requirements: int,
+        local_oob_data_present: int,
+        remote_io_capability: int,
+        remote_auth_requirements: int,
+        remote_oob_data_present: int,
+    ) -> AuthenticationMethod:
+        if local_oob_data_present and remote_oob_data_present:
+            return AuthenticationMethod.OUT_OF_BAND
+
+        mitm_required = bool(
+            (local_auth_requirements & 0x01) or (remote_auth_requirements & 0x01)
+        )
+
+        if not mitm_required:
+            return AuthenticationMethod.JUST_WORKS
+
+        if (
+            local_io_capability == hci.IoCapability.NO_INPUT_NO_OUTPUT
+            or remote_io_capability == hci.IoCapability.NO_INPUT_NO_OUTPUT
+        ):
+            return AuthenticationMethod.JUST_WORKS
+
+        if local_io_capability == hci.IoCapability.KEYBOARD_ONLY:
+            return AuthenticationMethod.PASSKEY_REQUEST
+
+        if remote_io_capability == hci.IoCapability.KEYBOARD_ONLY:
+            return AuthenticationMethod.PASSKEY_NOTIFICATION
+
+        if (
+            local_io_capability == hci.IoCapability.DISPLAY_YES_NO
+            and remote_io_capability == hci.IoCapability.DISPLAY_YES_NO
+        ):
+            return AuthenticationMethod.NUMERIC_COMPARISON
+
+        return AuthenticationMethod.JUST_WORKS
+
+    async def _send_public_key(
+        self, connection: Connection, local_private_key: crypto.EccKey
+    ) -> bool:
+        local_public_key_payload = local_private_key.x + local_private_key.y
+        self.send_lmp_packet(
+            connection.peer_address, lmp.LMP_P_256_PUBLIC_KEY_ENCAPSULATED_HEADER
+        )
+        match await self._reveived_lmp_packets[connection.peer_address].get():
+            case lmp.LmpNotAccepted():
+                return False
+        for offset in range(0, 64, 16):
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpEncapsulatedPayload(
+                    local_public_key_payload[offset : offset + 16]
+                ),
+            )
+            match await self._reveived_lmp_packets[connection.peer_address].get():
+                case lmp.LmpNotAccepted():
+                    return False
+        return True
+
+    async def _receive_public_key(self, connection: Connection) -> bytes:
+        match await self._reveived_lmp_packets[connection.peer_address].get():
+            case lmp.LmpEncapsulatedHeader():
+                pass
+        self.send_lmp_packet(
+            connection.peer_address,
+            lmp.LmpAccepted(lmp.Opcode.LMP_ENCAPSULATED_HEADER),
+        )
+        remote_public_key_bytes = b''
+        for _ in range(0, 64, 16):
+            match await self._reveived_lmp_packets[connection.peer_address].get():
+                case lmp.LmpEncapsulatedPayload(payload):
+                    remote_public_key_bytes += payload
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpAccepted(lmp.Opcode.LMP_ENCAPSULATED_PAYLOAD),
+            )
+        return remote_public_key_bytes
 
     ############################################################
     # Advertising support
@@ -1289,7 +1766,7 @@ class Controller:
         self.send_lmp_packet(command.bd_addr, lmp.LmpHostConnectionReq())
 
         def on_response(future: asyncio.Future[lmp.Packet]) -> None:
-            match (response := future.result()):
+            match response := future.result():
                 case lmp.LmpAccepted():
                     status: int = hci.HCI_ErrorCode.SUCCESS
                 case lmp.LmpNotAccepted():
@@ -1336,12 +1813,118 @@ class Controller:
             status=status, bd_addr=command.bd_addr
         )
 
+    def on_hci_io_capability_request_reply_command(
+        self, command: hci.HCI_IO_Capability_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.29 IO Capability Request Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_io_capability_request_negative_reply_command(
+        self, command: hci.HCI_IO_Capability_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.30 IO Capability Request Negative Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_user_confirmation_request_reply_command(
+        self, command: hci.HCI_User_Confirmation_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.30 User Confirmation Request Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_user_confirmation_request_negative_reply_command(
+        self, command: hci.HCI_User_Confirmation_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.31 User Confirmation Request Negative Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_user_passkey_request_reply_command(
+        self, command: hci.HCI_User_Passkey_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.32 User Passkey Request Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
+    def on_hci_user_passkey_request_negative_reply_command(
+        self, command: hci.HCI_User_Passkey_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.33 User Passkey Request Negative Reply Command
+        '''
+        if future := self._expected_hci_commands[command.bd_addr].pop(
+            command.op_code, None
+        ):
+            future.set_result(command)
+            status = hci.HCI_ErrorCode.SUCCESS
+        else:
+            status = hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=status, bd_addr=command.bd_addr
+        )
+
     def on_hci_authentication_requested_command(
         self, command: hci.HCI_Authentication_Requested_Command
     ) -> None:
         # See Bluetooth spec Vol 4, Part E - 7.1.15 Authentication Requested Command
-        self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
-
         if (
             connection := self.find_classic_connection_by_handle(
                 command.connection_handle
@@ -1441,7 +2024,7 @@ class Controller:
             self.send_lmp_packet(command.bd_addr, lmp.LmpSwitchReq())
 
             def on_response(future: asyncio.Future[lmp.Packet]) -> None:
-                match (response := future.result()):
+                match response := future.result():
                     case lmp.LmpAccepted():
                         self.classic_role_change(connection)
                         # Continue connection setup.
@@ -1526,7 +2109,7 @@ class Controller:
         )
 
         def on_response(future: asyncio.Future[lmp.Packet]) -> None:
-            match (response := future.result()):
+            match response := future.result():
                 case lmp.LmpAccepted() | lmp.LmpAcceptedExt():
                     status: int = hci.HCI_ErrorCode.SUCCESS
                 case lmp.LmpNotAccepted() | lmp.LmpNotAcceptedExt():
@@ -1646,7 +2229,7 @@ class Controller:
             self.send_lmp_packet(command.bd_addr, lmp.LmpSwitchReq())
 
             def on_response(future: asyncio.Future[lmp.Packet]) -> None:
-                match (response := future.result()):
+                match response := future.result():
                     case lmp.LmpAccepted():
                         connection.role = hci.Role(command.role)
                         status: int = hci.HCI_ErrorCode.SUCCESS

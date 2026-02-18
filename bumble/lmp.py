@@ -330,3 +330,74 @@ class LmpSres(Packet):
     opcode = Opcode.LMP_SRES
 
     authentication_response: bytes = field(metadata=hci.metadata(4))
+
+
+@Packet.subclass
+@dataclass
+class LmpIoCapabilityReq(Packet):
+    opcode = Opcode.LMP_IO_CAPABILITY_REQ
+
+    io_capability: int = field(metadata=hci.metadata(1))
+    oob_data_present: int = field(metadata=hci.metadata(1))
+    authentication_requirements: int = field(metadata=hci.metadata(1))
+
+
+@Packet.subclass
+@dataclass
+class LmpIoCapabilityRes(Packet):
+    opcode = Opcode.LMP_IO_CAPABILITY_RES
+
+    io_capability: int = field(metadata=hci.metadata(1))
+    oob_data_present: int = field(metadata=hci.metadata(1))
+    authentication_requirements: int = field(metadata=hci.metadata(1))
+
+
+@Packet.subclass
+@dataclass
+class LmpSimplePairingConfirm(Packet):
+    opcode = Opcode.LMP_SIMPLE_PAIRING_CONFIRM
+
+    commitment: bytes = field(metadata=hci.metadata(16))
+
+
+@Packet.subclass
+@dataclass
+class LmpSimplePairingNumber(Packet):
+    opcode = Opcode.LMP_SIMPLE_PAIRING_NUMBER
+
+    numeric_value: bytes = field(metadata=hci.metadata(4))
+
+
+@Packet.subclass
+@dataclass
+class LmpDhkeyCheck(Packet):
+    opcode = Opcode.LMP_DHKEY_CHECK
+
+    dhkey_check: bytes = field(metadata=hci.metadata(16))
+
+
+@Packet.subclass
+@dataclass
+class LmpEncapsulatedHeader(Packet):
+    opcode = Opcode.LMP_ENCAPSULATED_HEADER
+
+    encap_major_type: int = field(metadata=hci.metadata(1))
+    encap_minor_type: int = field(metadata=hci.metadata(1))
+    encap_payload_length: int = field(metadata=hci.metadata(1))
+
+
+LMP_P_192_PUBLIC_KEY_ENCAPSULATED_HEADER = LmpEncapsulatedHeader(
+    encap_major_type=1, encap_minor_type=1, encap_payload_length=48
+)
+
+LMP_P_256_PUBLIC_KEY_ENCAPSULATED_HEADER = LmpEncapsulatedHeader(
+    encap_major_type=1, encap_minor_type=2, encap_payload_length=64
+)
+
+
+@Packet.subclass
+@dataclass
+class LmpEncapsulatedPayload(Packet):
+    opcode = Opcode.LMP_ENCAPSULATED_PAYLOAD
+
+    encap_data: bytes = field(metadata=hci.metadata('*'))

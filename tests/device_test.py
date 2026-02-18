@@ -17,13 +17,14 @@
 # -----------------------------------------------------------------------------
 import asyncio
 import functools
+import itertools
 import logging
 import os
 from unittest import mock
 
 import pytest
 
-from bumble import gatt, hci, utils
+from bumble import gatt, hci, keys, pairing, utils
 from bumble.core import PhysicalTransport
 from bumble.device import (
     Advertisement,
@@ -51,7 +52,6 @@ from bumble.hci import (
     Role,
 )
 from bumble.host import DataPacketQueue, Host
-from bumble.keys import PairingKeys
 
 from .test_utils import TwoDevices, async_barrier
 
@@ -860,14 +860,15 @@ async def test_classic_link_key_authentication(
 
     # Initiator always has the key
     await devices[0].keystore.update(
-        str(devices[1].public_address), PairingKeys(link_key=PairingKeys.Key(link_key))
+        str(devices[1].public_address),
+        keys.PairingKeys(link_key=keys.PairingKeys.Key(link_key)),
     )
 
     if responder_has_key:
         responder_key = link_key if keys_match else wrong_key
         await devices[1].keystore.update(
             str(devices[0].public_address),
-            PairingKeys(link_key=PairingKeys.Key(responder_key)),
+            keys.PairingKeys(link_key=keys.PairingKeys.Key(responder_key)),
         )
 
     if expected_error:
@@ -876,6 +877,125 @@ async def test_classic_link_key_authentication(
         assert excinfo.value.error_code == expected_error
     else:
         await connection0.authenticate()
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "io_capability_0, io_capability_1",
+    [
+        *itertools.product(
+            pairing.PairingDelegate.IoCapability,
+            pairing.PairingDelegate.IoCapability,
+        )
+    ],
+)
+@pytest.mark.asyncio
+async def test_classic_ssp_success(io_capability_0, io_capability_1):
+    devices = TwoDevices()
+
+    # Enable Classic
+    devices[0].classic_enabled = True
+    devices[1].classic_enabled = True
+
+    numbers_0 = asyncio.Queue[int]()
+    numbers_1 = asyncio.Queue[int]()
+
+    class TestPairingDelegate(pairing.PairingDelegate):
+
+        def __init__(
+            self,
+            io_capability: pairing.PairingDelegate.IoCapability,
+            self_queue: asyncio.Queue[int],
+            peer_queue: asyncio.Queue[int],
+        ) -> None:
+            super().__init__(io_capability=io_capability)
+            self.self_queue = self_queue
+            self.peer_queue = peer_queue
+
+        async def confirm(self, auto: bool = False) -> bool:
+            return True
+
+        async def compare_numbers(self, number: int, digits: int) -> bool:
+            del digits
+            self.self_queue.put_nowait(number)
+            peer_number = await self.peer_queue.get()
+            return peer_number == number
+
+        async def get_number(self) -> int | None:
+            if (
+                io_capability_0
+                == pairing.PairingDelegate.IoCapability.KEYBOARD_INPUT_ONLY
+                and io_capability_1
+                == pairing.PairingDelegate.IoCapability.KEYBOARD_INPUT_ONLY
+            ):
+                return 123456
+            else:
+                return await self.peer_queue.get()
+
+        async def display_number(self, number: int, digits: int) -> None:
+            del digits
+            self.self_queue.put_nowait(number)
+
+    class TestKeyStore(keys.MemoryKeyStore):
+
+        def __init__(self, queue: asyncio.Queue[tuple[str, keys.PairingKeys]]) -> None:
+            super().__init__()
+            self.queue = queue
+
+        async def update(self, name: str, keys: keys.PairingKeys) -> None:
+            await super().update(name, keys)
+            self.queue.put_nowait((name, keys))
+
+    key_queues = [asyncio.Queue(), asyncio.Queue()]
+
+    devices[0].pairing_config_factory = lambda _: pairing.PairingConfig(
+        delegate=TestPairingDelegate(
+            io_capability=io_capability_0, self_queue=numbers_0, peer_queue=numbers_1
+        )
+    )
+    devices[1].pairing_config_factory = lambda _: pairing.PairingConfig(
+        delegate=TestPairingDelegate(
+            io_capability=io_capability_1, self_queue=numbers_1, peer_queue=numbers_0
+        )
+    )
+    devices[0].keystore = TestKeyStore(key_queues[0])
+    devices[1].keystore = TestKeyStore(key_queues[1])
+
+    await devices[0].power_on()
+    await devices[1].power_on()
+
+    # Connect
+    connections = await asyncio.gather(
+        devices[0].connect(
+            devices[1].public_address, transport=PhysicalTransport.BR_EDR
+        ),
+        devices[1].accept(role=hci.Role.PERIPHERAL),
+    )
+
+    pairing_results = [
+        asyncio.get_running_loop().create_future(),
+        asyncio.get_running_loop().create_future(),
+    ]
+    for connection, pairing_result in zip(connections, pairing_results):
+        connection.on(
+            connection.EVENT_CLASSIC_PAIRING,
+            functools.partial(lambda future: future.set_result(None), pairing_result),
+        )
+        connection.on(
+            connection.EVENT_CLASSIC_PAIRING_FAILURE,
+            functools.partial(
+                lambda future, status: future.set_exception(AssertionError(status)),
+                pairing_result,
+            ),
+        )
+
+    await asyncio.wait_for(connections[0].authenticate(), _TIMEOUT)
+
+    await asyncio.wait_for(pairing_results[0], _TIMEOUT)
+    await asyncio.wait_for(pairing_results[1], _TIMEOUT)
+
+    await asyncio.wait_for(key_queues[0].get(), _TIMEOUT)
+    await asyncio.wait_for(key_queues[1].get(), _TIMEOUT)
 
 
 # -----------------------------------------------------------------------------

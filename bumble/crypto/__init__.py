@@ -17,6 +17,8 @@
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import operator
 import secrets
@@ -75,6 +77,14 @@ def r() -> bytes:
 
 
 # -----------------------------------------------------------------------------
+def hmac_sha_256(message: bytes, key: bytes) -> bytes:
+    '''
+    Generate 16 bytes of random data
+    '''
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
+# -----------------------------------------------------------------------------
 def ah(k: bytes, r: bytes) -> bytes:  # pylint: disable=redefined-outer-name
     '''
     See Bluetooth spec Vol 3, Part H - 2.2.2 Random Address Hash function ah
@@ -114,6 +124,15 @@ def s1(k: bytes, r1: bytes, r2: bytes) -> bytes:
     '''
 
     return e(k, r2[0:8] + r1[0:8])
+
+
+# -----------------------------------------------------------------------------
+def f1(u: bytes, v: bytes, x: bytes, z: bytes) -> bytes:
+    '''
+    See Bluetooth spec, Vol 2, Part H - 7.7.1. The Secure Simple Pairing commitment
+    function f1.
+    '''
+    return reverse(hmac_sha_256(reverse(u) + reverse(v) + reverse(z), reverse(x)))
 
 
 # -----------------------------------------------------------------------------
@@ -182,6 +201,17 @@ def f6(
             + reverse(a2),
             reverse(w),
         )
+    )
+
+
+# -----------------------------------------------------------------------------
+def g(u: bytes, v: bytes, x: bytes, y: bytes) -> bytes:
+    '''
+    See Bluetooth spec, Vol 2, Part H - 7.7.2. The Secure Simple Pairing numeric
+    verification function g.
+    '''
+    return reverse(
+        hashlib.sha256(reverse(u) + reverse(v) + reverse(x) + reverse(y)).digest()
     )
 
 
