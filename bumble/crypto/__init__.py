@@ -132,7 +132,42 @@ def f1(u: bytes, v: bytes, x: bytes, z: bytes) -> bytes:
     See Bluetooth spec, Vol 2, Part H - 7.7.1. The Secure Simple Pairing commitment
     function f1.
     '''
-    return reverse(hmac_sha_256(reverse(u) + reverse(v) + reverse(z), reverse(x)))
+    return reverse(hmac_sha_256(reverse(u) + reverse(v) + reverse(z), reverse(x))[:16])
+
+
+# -----------------------------------------------------------------------------
+def f2(w: bytes, n1: bytes, n2: bytes, key_id: bytes, a1: bytes, a2: bytes) -> bytes:
+    '''
+    See Bluetooth spec, Vol 2, Part H - 7.7.3. The Secure Simple Pairing key
+    generation function f2.
+    '''
+    return reverse(
+        hmac_sha_256(
+            reverse(n1) + reverse(n2) + reverse(key_id) + reverse(a1) + reverse(a2),
+            reverse(w),
+        )[:16]
+    )
+
+
+# -----------------------------------------------------------------------------
+def f3(
+    w: bytes, n1: bytes, n2: bytes, r: bytes, io_cap: bytes, a1: bytes, a2: bytes
+) -> bytes:
+    '''
+    See Bluetooth spec, Vol 2, Part H - 7.7.4. The Secure Simple Pairing check
+    value generation function f3.
+    '''
+    return reverse(
+        hmac_sha_256(
+            reverse(n1)
+            + reverse(n2)
+            + reverse(r)
+            + reverse(io_cap)
+            + reverse(a1)
+            + reverse(a2),
+            reverse(w),
+        )[:16]
+    )
 
 
 # -----------------------------------------------------------------------------
