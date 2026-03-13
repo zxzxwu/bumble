@@ -17,13 +17,15 @@
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
+import dataclasses
 import struct
 
 
 # -----------------------------------------------------------------------------
+@dataclasses.dataclass
 class MediaPacket:
-    @staticmethod
-    def from_bytes(data: bytes) -> MediaPacket:
+    @classmethod
+    def from_bytes(cls, data: bytes) -> MediaPacket:
         version = (data[0] >> 6) & 0x03
         padding = (data[0] >> 5) & 0x01
         extension = (data[0] >> 4) & 0x01
@@ -38,43 +40,34 @@ class MediaPacket:
         ]
         payload = data[12 + csrc_count * 4 :]
 
-        return MediaPacket(
-            version,
-            padding,
-            extension,
-            marker,
-            sequence_number,
-            timestamp,
-            ssrc,
-            csrc_list,
-            payload_type,
-            payload,
+        return cls(
+            version=version,
+            padding=padding,
+            extension=extension,
+            marker=marker,
+            sequence_number=sequence_number,
+            timestamp=timestamp,
+            ssrc=ssrc,
+            csrc_list=csrc_list,
+            payload_type=payload_type,
+            payload=payload,
         )
 
-    def __init__(
-        self,
-        version: int,
-        padding: int,
-        extension: int,
-        marker: int,
-        sequence_number: int,
-        timestamp: int,
-        ssrc: int,
-        csrc_list: list[int],
-        payload_type: int,
-        payload: bytes,
-    ) -> None:
-        self.version = version
-        self.padding = padding
-        self.extension = extension
-        self.marker = marker
-        self.sequence_number = sequence_number & 0xFFFF
-        self.timestamp = timestamp & 0xFFFFFFFF
+    version: int
+    padding: int
+    extension: int
+    marker: int
+    sequence_number: int
+    timestamp: int
+    ssrc: int
+    csrc_list: list[int]
+    payload_type: int
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        self.sequence_number &= 0xFFFF
+        self.timestamp &= 0xFFFFFFFF
         self.timestamp_seconds = 0.0
-        self.ssrc = ssrc
-        self.csrc_list = csrc_list
-        self.payload_type = payload_type
-        self.payload = payload
 
     def __bytes__(self) -> bytes:
         header = bytes(

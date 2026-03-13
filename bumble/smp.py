@@ -513,13 +513,11 @@ class OobContext:
 
 
 # -----------------------------------------------------------------------------
+@dataclass
 class OobLegacyContext:
     """Cryptographic context for LE Legacy OOB pairing."""
 
-    tk: bytes
-
-    def __init__(self, tk: bytes | None = None) -> None:
-        self.tk = crypto.r() if tk is None else tk
+    tk: bytes = field(default_factory=crypto.r)
 
 
 # -----------------------------------------------------------------------------
@@ -622,7 +620,7 @@ class Session:
     ) -> None:
         self.manager = manager
         self.connection = connection
-        self.stk = None
+        self.stk: bytes | None = None
         self.ltk_ediv = 0
         self.ltk_rand = bytes(8)
         self.link_key: bytes | None = None
@@ -632,15 +630,15 @@ class Session:
         self.peer_random_value: bytes | None = None
         self.peer_public_key_x: bytes = bytes(32)
         self.peer_public_key_y = bytes(32)
-        self.peer_ltk = None
-        self.peer_ediv = None
+        self.peer_ltk: bytes | None = None
+        self.peer_ediv: int | None = None
         self.peer_rand: bytes | None = None
-        self.peer_identity_resolving_key = None
+        self.peer_identity_resolving_key: bytes | None = None
         self.peer_bd_addr: Address | None = None
-        self.peer_signature_key = None
+        self.peer_signature_key: bytes | None = None
         self.peer_expected_distributions: list[type[SMP_Command]] = []
         self.dh_key = b''
-        self.confirm_value = None
+        self.confirm_value: bytes | None = None
         self.passkey: int | None = None
         self.passkey_ready = asyncio.Event()
         self.passkey_step = 0

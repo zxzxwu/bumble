@@ -17,9 +17,9 @@
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
+import dataclasses
 import enum
 import secrets
-from dataclasses import dataclass
 
 from bumble import hci, smp
 from bumble.core import AdvertisingData, LeRole
@@ -31,7 +31,7 @@ from bumble.smp import (
 
 
 # -----------------------------------------------------------------------------
-@dataclass
+@dataclasses.dataclass
 class OobData:
     """OOB data that can be sent from one device to another."""
 
@@ -80,6 +80,7 @@ class OobData:
 
 
 # -----------------------------------------------------------------------------
+@dataclasses.dataclass
 class PairingDelegate:
     """Abstract base class for Pairing Delegates."""
 
@@ -107,7 +108,7 @@ class PairingDelegate:
         DISTRIBUTE_SIGNING_KEY = smp.KeyDistribution.SIGN_KEY
         DISTRIBUTE_LINK_KEY = smp.KeyDistribution.LINK_KEY
 
-    DEFAULT_KEY_DISTRIBUTION: KeyDistribution = (
+    DEFAULT_KEY_DISTRIBUTION = (
         KeyDistribution.DISTRIBUTE_ENCRYPTION_KEY
         | KeyDistribution.DISTRIBUTE_IDENTITY_KEY
     )
@@ -122,22 +123,10 @@ class PairingDelegate:
         DISPLAY_OUTPUT_AND_KEYBOARD_INPUT: hci.IoCapability.DISPLAY_YES_NO,
     }
 
-    io_capability: IoCapability
-    local_initiator_key_distribution: KeyDistribution
-    local_responder_key_distribution: KeyDistribution
-    maximum_encryption_key_size: int
-
-    def __init__(
-        self,
-        io_capability: IoCapability = NO_OUTPUT_NO_INPUT,
-        local_initiator_key_distribution: KeyDistribution = DEFAULT_KEY_DISTRIBUTION,
-        local_responder_key_distribution: KeyDistribution = DEFAULT_KEY_DISTRIBUTION,
-        maximum_encryption_key_size: int = 16,
-    ) -> None:
-        self.io_capability = io_capability
-        self.local_initiator_key_distribution = local_initiator_key_distribution
-        self.local_responder_key_distribution = local_responder_key_distribution
-        self.maximum_encryption_key_size = maximum_encryption_key_size
+    io_capability: IoCapability = NO_OUTPUT_NO_INPUT
+    local_initiator_key_distribution: KeyDistribution = DEFAULT_KEY_DISTRIBUTION
+    local_responder_key_distribution: KeyDistribution = DEFAULT_KEY_DISTRIBUTION
+    maximum_encryption_key_size: int = 16
 
     @property
     def classic_io_capability(self) -> int:
@@ -218,6 +207,7 @@ class PairingDelegate:
 
 
 # -----------------------------------------------------------------------------
+@dataclasses.dataclass
 class PairingConfig:
     """Configuration for the Pairing protocol."""
 
@@ -225,7 +215,7 @@ class PairingConfig:
         PUBLIC = hci.Address.PUBLIC_DEVICE_ADDRESS
         RANDOM = hci.Address.RANDOM_DEVICE_ADDRESS
 
-    @dataclass
+    @dataclasses.dataclass
     class OobConfig:
         """Config for OOB pairing."""
 
@@ -233,27 +223,9 @@ class PairingConfig:
         peer_data: OobSharedData | None
         legacy_context: OobLegacyContext | None
 
-    def __init__(
-        self,
-        sc: bool = True,
-        mitm: bool = True,
-        bonding: bool = True,
-        delegate: PairingDelegate | None = None,
-        identity_address_type: AddressType | None = None,
-        oob: OobConfig | None = None,
-    ) -> None:
-        self.sc = sc
-        self.mitm = mitm
-        self.bonding = bonding
-        self.delegate = delegate or PairingDelegate()
-        self.identity_address_type = identity_address_type
-        self.oob = oob
-
-    def __str__(self) -> str:
-        return (
-            f'PairingConfig(sc={self.sc}, '
-            f'mitm={self.mitm}, bonding={self.bonding}, '
-            f'identity_address_type={self.identity_address_type}, '
-            f'delegate[{self.delegate.io_capability}]), '
-            f'oob[{self.oob}])'
-        )
+    sc: bool = True
+    mitm: bool = True
+    bonding: bool = True
+    delegate: PairingDelegate = dataclasses.field(default_factory=PairingDelegate)
+    identity_address_type: AddressType | None = None
+    oob: OobConfig | None = None
