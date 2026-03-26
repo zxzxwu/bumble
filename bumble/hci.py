@@ -7943,13 +7943,15 @@ class HCI_Remote_Host_Supported_Features_Notification_Event(HCI_Event):
 
 # -----------------------------------------------------------------------------
 @HCI_Event.event
-@dataclasses.dataclass
 class HCI_Vendor_Event(HCI_Event):
     '''
     See Bluetooth spec @ 5.4.4 HCI Event packet
     '''
 
-    data: bytes = field(metadata=metadata("*"))
+    fields = (('data', '*'),)
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
 
 
 # -----------------------------------------------------------------------------
