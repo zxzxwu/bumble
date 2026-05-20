@@ -1947,8 +1947,6 @@ class Stream:
             self.rtp_channel = None
 
         # Release the endpoint
-        self.local_endpoint.in_use = 0
-
         self.change_state(State.IDLE)
 
     async def on_set_configuration_command(
@@ -2039,7 +2037,6 @@ class Stream:
 
         if self.rtp_channel is None:
             # No channel to release, we're done
-            self.local_endpoint.in_use = 0
             self.change_state(State.IDLE)
         else:
             # TODO: set a timer as we wait for the RTP channel to be closed
@@ -2051,7 +2048,6 @@ class Stream:
         await self.local_endpoint.on_abort_command()
         if self.rtp_channel is None:
             # No need to wait
-            self.local_endpoint.in_use = 0
             self.change_state(State.IDLE)
         else:
             # Wait for the RTP channel to be closed
@@ -2074,7 +2070,6 @@ class Stream:
     def on_l2cap_channel_close(self) -> None:
         logger.debug(color('<<< stream channel closed', 'magenta'))
         self.local_endpoint.on_rtp_channel_close()
-        self.local_endpoint.in_use = 0
         self.rtp_channel = None
 
         if self.state in (State.CLOSING, State.ABORTING):
@@ -2099,7 +2094,6 @@ class Stream:
         self.state = State.IDLE
 
         local_endpoint.stream = self
-        local_endpoint.in_use = 1
 
     def __str__(self) -> str:
         return (
@@ -2109,13 +2103,29 @@ class Stream:
 
 
 # -----------------------------------------------------------------------------
-@dataclass
 class StreamEndPoint:
     seid: int
     media_type: MediaType
     tsep: StreamEndPointType
-    in_use: int
     capabilities: Iterable[ServiceCapabilities]
+
+    def __init__(
+        self,
+        seid: int,
+        media_type: MediaType,
+        tsep: StreamEndPointType,
+        in_use: int,
+        capabilities: Iterable[ServiceCapabilities],
+    ) -> None:
+        self.seid = seid
+        self.media_type = media_type
+        self.tsep = tsep
+        self._in_use = in_use
+        self.capabilities = capabilities
+
+    @property
+    def in_use(self) -> int:
+        return self._in_use
 
 
 # -----------------------------------------------------------------------------
@@ -2170,6 +2180,12 @@ class DiscoveredStreamEndPoint(StreamEndPoint, StreamEndPointProxy):
 # -----------------------------------------------------------------------------
 class LocalStreamEndPoint(StreamEndPoint, utils.EventEmitter):
     stream: Stream | None
+
+    @property
+    def in_use(self) -> int:
+        if self.stream is None:
+            return 0
+        return 1 if self.stream.state != State.IDLE else 0
 
     EVENT_CONFIGURATION = "configuration"
     EVENT_OPEN = "open"
