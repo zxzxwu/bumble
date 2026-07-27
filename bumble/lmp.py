@@ -33,14 +33,14 @@ class Opcode(utils.OpenIntEnum):
 
     # fmt: off
     LMP_ACCEPTED                    = 3
-    LMP_ACCEPTED_EXT                = 127 << 8 + 1
+    LMP_ACCEPTED_EXT                = (127 << 8) + 1
     LMP_AU_RAND                     = 11
     LMP_AUTO_RATE                   = 35
-    LMP_CHANNEL_CLASSIFICATION      = 127 << 8 + 17
-    LMP_CHANNEL_CLASSIFICATION_REQ  = 127 << 8 + 16
-    LMP_CLK_ADJ                     = 127 << 8 + 5
-    LMP_CLK_ADJ_ACK                 = 127 << 8 + 6
-    LMP_CLK_ADJ_REQ                 = 127 << 8 + 7
+    LMP_CHANNEL_CLASSIFICATION      = (127 << 8) + 17
+    LMP_CHANNEL_CLASSIFICATION_REQ  = (127 << 8) + 16
+    LMP_CLK_ADJ                     = (127 << 8) + 5
+    LMP_CLK_ADJ_ACK                 = (127 << 8) + 6
+    LMP_CLK_ADJ_REQ                 = (127 << 8) + 7
     LMP_CLKOFFSET_REQ               = 5
     LMP_CLKOFFSET_RES               = 6
     LMP_COMB_KEY                    = 9
@@ -53,19 +53,19 @@ class Opcode(utils.OpenIntEnum):
     LMP_ENCRYPTION_KEY_SIZE_MASK_RES= 59
     LMP_ENCRYPTION_KEY_SIZE_REQ     = 16
     LMP_ENCRYPTION_MODE_REQ         = 15
-    LMP_ESCO_LINK_REQ               = 127 << 8 + 12
+    LMP_ESCO_LINK_REQ               = (127 << 8) + 12
     LMP_FEATURES_REQ                = 39
-    LMP_FEATURES_REQ_EXT            = 127 << 8 + 3
+    LMP_FEATURES_REQ_EXT            = (127 << 8) + 3
     LMP_FEATURES_RES                = 40
-    LMP_FEATURES_RES_EXT            = 127 << 8 + 4
+    LMP_FEATURES_RES_EXT            = (127 << 8) + 4
     LMP_HOLD                        = 20
     LMP_HOLD_REQ                    = 21
     LMP_HOST_CONNECTION_REQ         = 51
     LMP_IN_RAND                     = 8
     LMP_INCR_POWER_REQ              = 31
-    LMP_IO_CAPABILITY_REQ           = 127 << 8 + 25
-    LMP_IO_CAPABILITY_RES           = 127 << 8 + 26
-    LMP_KEYPRESS_NOTIFICATION       = 127 << 8 + 30
+    LMP_IO_CAPABILITY_REQ           = (127 << 8) + 25
+    LMP_IO_CAPABILITY_RES           = (127 << 8) + 26
+    LMP_KEYPRESS_NOTIFICATION       = (127 << 8) + 30
     LMP_MAX_POWER                   = 33
     LMP_MAX_SLOT                    = 45
     LMP_MAX_SLOT_REQ                = 46
@@ -73,28 +73,28 @@ class Opcode(utils.OpenIntEnum):
     LMP_NAME_REQ                    = 1
     LMP_NAME_RES                    = 2
     LMP_NOT_ACCEPTED                = 4
-    LMP_NOT_ACCEPTED_EXT            = 127 << 8 + 2
-    LMP_NUMERIC_COMPARISON_FAILED   = 127 << 8 + 27
-    LMP_OOB_FAILED                  = 127 << 8 + 29
-    LMP_PACKET_TYPE_TABLE_REQ       = 127 << 8 + 11
+    LMP_NOT_ACCEPTED_EXT            = (127 << 8) + 2
+    LMP_NUMERIC_COMPARISON_FAILED   = (127 << 8) + 27
+    LMP_OOB_FAILED                  = (127 << 8) + 29
+    LMP_PACKET_TYPE_TABLE_REQ       = (127 << 8) + 11
     LMP_PAGE_MODE_REQ               = 53
     LMP_PAGE_SCAN_MODE_REQ          = 54
-    LMP_PASSKEY_FAILED              = 127 << 8 + 28
+    LMP_PASSKEY_FAILED              = (127 << 8) + 28
     LMP_PAUSE_ENCRYPTION_AES_REQ    = 66
-    LMP_PAUSE_ENCRYPTION_REQ        = 127 << 8 + 23
-    LMP_PING_REQ                    = 127 << 8 + 33
-    LMP_PING_RES                    = 127 << 8 + 34
-    LMP_POWER_CONTROL_REQ           = 127 << 8 + 31
-    LMP_POWER_CONTROL_RES           = 127 << 8 + 32
+    LMP_PAUSE_ENCRYPTION_REQ        = (127 << 8) + 23
+    LMP_PING_REQ                    = (127 << 8) + 33
+    LMP_PING_RES                    = (127 << 8) + 34
+    LMP_POWER_CONTROL_REQ           = (127 << 8) + 31
+    LMP_POWER_CONTROL_RES           = (127 << 8) + 32
     LMP_PREFERRED_RATE              = 36
     LMP_QUALITY_OF_SERVICE          = 41
     LMP_QUALITY_OF_SERVICE_REQ      = 42
-    LMP_REMOVE_ESCO_LINK_REQ        = 127 << 8 + 13
+    LMP_REMOVE_ESCO_LINK_REQ        = (127 << 8) + 13
     LMP_REMOVE_SCO_LINK_REQ         = 44
-    LMP_RESUME_ENCRYPTION_REQ       = 127 << 8 + 24
-    LMP_SAM_DEFINE_MAP              = 127 << 8 + 36
-    LMP_SAM_SET_TYPE0               = 127 << 8 + 35
-    LMP_SAM_SWITCH                  = 127 << 8 + 37
+    LMP_RESUME_ENCRYPTION_REQ       = (127 << 8) + 24
+    LMP_SAM_DEFINE_MAP              = (127 << 8) + 36
+    LMP_SAM_SET_TYPE0               = (127 << 8) + 35
+    LMP_SAM_SWITCH                  = (127 << 8) + 37
     LMP_SCO_LINK_REQ                = 43
     LMP_SET_AFH                     = 60
     LMP_SETUP_COMPLETE              = 49
@@ -102,8 +102,8 @@ class Opcode(utils.OpenIntEnum):
     LMP_SIMPLE_PAIRING_NUMBER       = 64
     LMP_SLOT_OFFSET                 = 52
     LMP_SNIFF_REQ                   = 23
-    LMP_SNIFF_SUBRATING_REQ         = 127 << 8 + 21
-    LMP_SNIFF_SUBRATING_RES         = 127 << 8 + 22
+    LMP_SNIFF_SUBRATING_REQ         = (127 << 8) + 21
+    LMP_SNIFF_SUBRATING_RES         = (127 << 8) + 22
     LMP_SRES                        = 12
     LMP_START_ENCRYPTION_REQ        = 17
     LMP_STOP_ENCRYPTION_REQ         = 18
@@ -214,7 +214,7 @@ class LmpNotAccepted(Packet):
 class LmpAcceptedExt(Packet):
     opcode = Opcode.LMP_ACCEPTED_EXT
 
-    response_opcode: Opcode = field(metadata=Opcode.type_metadata())
+    response_opcode: int = field(metadata=hci.metadata(1))
 
 
 @Packet.subclass
@@ -222,7 +222,7 @@ class LmpAcceptedExt(Packet):
 class LmpNotAcceptedExt(Packet):
     opcode = Opcode.LMP_NOT_ACCEPTED_EXT
 
-    response_opcode: Opcode = field(metadata=Opcode.type_metadata())
+    response_opcode: int = field(metadata=hci.metadata(1))
     error_code: int = field(metadata=hci.metadata(1))
 
 
@@ -357,3 +357,91 @@ class LmpFeaturesResExt(Packet):
     features_page: int = field(metadata=hci.metadata(1))
     max_features_page: int = field(metadata=hci.metadata(1))
     features: bytes = field(metadata=hci.metadata(8))
+
+
+@Packet.subclass
+@dataclass
+class LmpIoCapabilityReq(Packet):
+    opcode = Opcode.LMP_IO_CAPABILITY_REQ
+
+    io_capability: int = field(metadata=hci.metadata(1))
+    oob_data_present: int = field(metadata=hci.metadata(1))
+    authentication_requirements: int = field(metadata=hci.metadata(1))
+
+
+@Packet.subclass
+@dataclass
+class LmpIoCapabilityRes(Packet):
+    opcode = Opcode.LMP_IO_CAPABILITY_RES
+
+    io_capability: int = field(metadata=hci.metadata(1))
+    oob_data_present: int = field(metadata=hci.metadata(1))
+    authentication_requirements: int = field(metadata=hci.metadata(1))
+
+
+@Packet.subclass
+@dataclass
+class LmpEncapsulatedHeader(Packet):
+    opcode = Opcode.LMP_ENCAPSULATED_HEADER
+
+    major_opcode: int = field(metadata=hci.metadata(1))
+    minor_opcode: int = field(metadata=hci.metadata(1))
+    payload_len: int = field(metadata=hci.metadata(1))
+
+
+@Packet.subclass
+@dataclass
+class LmpEncapsulatedPayload(Packet):
+    opcode = Opcode.LMP_ENCAPSULATED_PAYLOAD
+
+    data: bytes = field(metadata=hci.metadata('*'))
+
+
+@Packet.subclass
+@dataclass
+class LmpSimplePairingConfirm(Packet):
+    opcode = Opcode.LMP_SIMPLE_PAIRING_CONFIRM
+
+    commitment: bytes = field(metadata=hci.metadata(16))
+
+
+@Packet.subclass
+@dataclass
+class LmpSimplePairingNumber(Packet):
+    opcode = Opcode.LMP_SIMPLE_PAIRING_NUMBER
+
+    nonce: bytes = field(metadata=hci.metadata(16))
+
+
+@Packet.subclass
+@dataclass
+class LmpDhkeyCheck(Packet):
+    opcode = Opcode.LMP_DHKEY_CHECK
+
+    check_value: bytes = field(metadata=hci.metadata(16))
+
+
+@Packet.subclass
+@dataclass
+class LmpNumericComparisonFailed(Packet):
+    opcode = Opcode.LMP_NUMERIC_COMPARISON_FAILED
+
+
+@Packet.subclass
+@dataclass
+class LmpPasskeyFailed(Packet):
+    opcode = Opcode.LMP_PASSKEY_FAILED
+
+
+@Packet.subclass
+@dataclass
+class LmpOobFailed(Packet):
+    opcode = Opcode.LMP_OOB_FAILED
+
+
+@Packet.subclass
+@dataclass
+class LmpKeypressNotification(Packet):
+    opcode = Opcode.LMP_KEYPRESS_NOTIFICATION
+
+    notification_type: int = field(metadata=hci.metadata(1))

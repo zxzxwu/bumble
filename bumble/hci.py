@@ -3093,6 +3093,20 @@ class HCI_IO_Capability_Request_Negative_Reply_Command(
 
 
 # -----------------------------------------------------------------------------
+@HCI_SyncCommand.sync_command(HCI_StatusAndAddressReturnParameters)
+@dataclasses.dataclass
+class HCI_Send_Keypress_Notification_Command(
+    HCI_SyncCommand[HCI_StatusAndAddressReturnParameters]
+):
+    '''
+    See Bluetooth spec @ 7.1.37 Send Keypress Notification Command
+    '''
+
+    bd_addr: Address = field(metadata=metadata(Address.parse_address))
+    notification_type: int = field(metadata=metadata(1))
+
+
+# -----------------------------------------------------------------------------
 @HCI_Command.command
 @dataclasses.dataclass
 class HCI_Enhanced_Setup_Synchronous_Connection_Command(HCI_AsyncCommand):
@@ -3849,6 +3863,21 @@ class HCI_Write_Extended_Inquiry_Response_Command(
     extended_inquiry_response: bytes = field(
         metadata=metadata({'size': 240, 'serializer': lambda x: padded_bytes(x, 240)})
     )
+
+
+@dataclasses.dataclass
+class HCI_Read_Simple_Pairing_Mode_ReturnParameters(HCI_StatusReturnParameters):
+    simple_pairing_mode: int = field(metadata=metadata(1))
+
+
+@HCI_SyncCommand.sync_command(HCI_Read_Simple_Pairing_Mode_ReturnParameters)
+@dataclasses.dataclass
+class HCI_Read_Simple_Pairing_Mode_Command(
+    HCI_SyncCommand[HCI_Read_Simple_Pairing_Mode_ReturnParameters]
+):
+    '''
+    See Bluetooth spec Vol 4, Part E - 7.3.58 Read Simple Pairing Mode Command
+    '''
 
 
 # -----------------------------------------------------------------------------

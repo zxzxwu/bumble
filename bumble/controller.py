@@ -22,10 +22,11 @@ import dataclasses
 import itertools
 import logging
 import random
+import secrets
 import struct
 from typing import TYPE_CHECKING, Any, cast
 
-from bumble import hci, link, ll, lmp
+from bumble import crypto, hci, link, ll, lmp
 from bumble import link as bumble_link
 from bumble.colors import color
 from bumble.core import PhysicalTransport
@@ -182,6 +183,31 @@ class ScoLink:
     peer_address: hci.Address
 
 
+@dataclasses.dataclass
+class SspState:
+    is_initiator: bool = False
+    local_io_capability: int | None = None
+    local_oob_data_present: int = 0
+    local_auth_reqs: int = 0
+    peer_io_capability: int | None = None
+    peer_oob_data_present: int = 0
+    peer_auth_reqs: int = 0
+    local_nonce: bytes | None = None
+    peer_nonce: bytes | None = None
+    local_confirm: bytes | None = None
+    peer_confirm: bytes | None = None
+    local_confirmed: bool = False
+    peer_confirmed: bool = False
+    passkey: int | None = None
+    passkey_round: int = 0
+    oob_c: bytes | None = None
+    oob_r: bytes | None = None
+    link_key: bytes | None = None
+    sent_dhkey_check: bool = False
+    pending_peer_dhkey_check: bytes | None = None
+    authenticated: bool = False
+
+
 # -----------------------------------------------------------------------------
 @dataclasses.dataclass
 class Connection:
@@ -194,6 +220,7 @@ class Connection:
     transport: PhysicalTransport
     link_type: int
     classic_allow_role_switch: bool = False
+    ssp_state: SspState = dataclasses.field(default_factory=SspState)
 
     def __post_init__(self) -> None:
         self.assembler = hci.HCI_AclDataPacketAssembler(self.on_acl_pdu)
@@ -1004,17 +1031,32 @@ class Controller:
             case lmp.LmpAccepted() | lmp.LmpAcceptedExt():
                 if future := self.classic_pending_commands.setdefault(
                     sender_address, {}
-                ).get(packet.response_opcode):
+                ).get(lmp.Opcode(packet.response_opcode)):
                     future.set_result(hci.HCI_ErrorCode.SUCCESS)
                 else:
                     logger.error("!!! Unhandled packet: %s", packet)
-            case lmp.LmpNotAccepted() | lmp.LmpNotAcceptedExt():
+            case lmp.LmpNotAccepted(response_opcode, error_code):
                 if future := self.classic_pending_commands.setdefault(
                     sender_address, {}
-                ).get(packet.response_opcode):
-                    future.set_result(packet.error_code)
-                else:
-                    logger.error("!!! Unhandled packet: %s", packet)
+                ).pop(lmp.Opcode(response_opcode), None):
+                    future.set_result(error_code)
+                if connection := self.classic_connections.get(sender_address):
+                    if response_opcode in (
+                        lmp.Opcode.LMP_IO_CAPABILITY_REQ,
+                        lmp.Opcode.LMP_IO_CAPABILITY_RES,
+                    ):
+                        self._on_ssp_failed(connection, error_code)
+            case lmp.LmpNotAcceptedExt(response_opcode, error_code):
+                if future := self.classic_pending_commands.setdefault(
+                    sender_address, {}
+                ).pop(lmp.Opcode((127 << 8) + response_opcode), None):
+                    future.set_result(error_code)
+                if connection := self.classic_connections.get(sender_address):
+                    if response_opcode in (
+                        lmp.Opcode.LMP_IO_CAPABILITY_REQ & 0xFF,
+                        lmp.Opcode.LMP_IO_CAPABILITY_RES & 0xFF,
+                    ):
+                        self._on_ssp_failed(connection, error_code)
             case lmp.LmpHostConnectionReq():
                 self.on_classic_connection_request(
                     sender_address, hci.HCI_Connection_Complete_Event.LinkType.ACL
@@ -1090,8 +1132,300 @@ class Controller:
                             extended_lmp_features=features,
                         )
                     )
+            case lmp.LmpIoCapabilityReq(io_cap, oob_data, auth_reqs):
+                if connection := self.classic_connections.get(sender_address):
+                    connection.ssp_state.peer_io_capability = io_cap
+                    connection.ssp_state.peer_oob_data_present = oob_data
+                    connection.ssp_state.peer_auth_reqs = auth_reqs
+                    self.send_hci_packet(
+                        hci.HCI_IO_Capability_Response_Event(
+                            bd_addr=sender_address,
+                            io_capability=io_cap,
+                            oob_data_present=oob_data,
+                            authentication_requirements=auth_reqs,
+                        )
+                    )
+                    self.send_hci_packet(
+                        hci.HCI_IO_Capability_Request_Event(bd_addr=sender_address)
+                    )
+            case lmp.LmpIoCapabilityRes(io_cap, oob_data, auth_reqs):
+                if connection := self.classic_connections.get(sender_address):
+                    connection.ssp_state.peer_io_capability = io_cap
+                    connection.ssp_state.peer_oob_data_present = oob_data
+                    connection.ssp_state.peer_auth_reqs = auth_reqs
+                    self.send_hci_packet(
+                        hci.HCI_IO_Capability_Response_Event(
+                            bd_addr=sender_address,
+                            io_capability=io_cap,
+                            oob_data_present=oob_data,
+                            authentication_requirements=auth_reqs,
+                        )
+                    )
+                    self._start_ssp_exchange(connection)
+            case lmp.LmpSimplePairingConfirm(commitment):
+                if connection := self.classic_connections.get(sender_address):
+                    connection.ssp_state.peer_confirm = commitment
+                    self._on_ssp_confirm_or_nonce_received(connection)
+            case lmp.LmpSimplePairingNumber(nonce):
+                if connection := self.classic_connections.get(sender_address):
+                    connection.ssp_state.peer_nonce = nonce
+                    self._on_ssp_confirm_or_nonce_received(connection)
+            case lmp.LmpDhkeyCheck(check_value):
+                if connection := self.classic_connections.get(sender_address):
+                    if (
+                        connection.ssp_state.local_io_capability
+                        == hci.IoCapability.KEYBOARD_ONLY
+                        and connection.ssp_state.peer_io_capability
+                        != hci.IoCapability.NO_INPUT_NO_OUTPUT
+                        and connection.ssp_state.passkey is None
+                    ):
+                        connection.ssp_state.pending_peer_dhkey_check = check_value
+                    else:
+                        self._verify_peer_dhkey_check(connection, check_value)
+            case lmp.LmpNumericComparisonFailed():
+                if connection := self.classic_connections.get(sender_address):
+                    self._on_ssp_failed(
+                        connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+                    )
+            case lmp.LmpPasskeyFailed():
+                if connection := self.classic_connections.get(sender_address):
+                    self._on_ssp_failed(
+                        connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+                    )
+            case lmp.LmpOobFailed():
+                if connection := self.classic_connections.get(sender_address):
+                    self._on_ssp_failed(
+                        connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+                    )
+            case lmp.LmpKeypressNotification(notification_type):
+                if connection := self.classic_connections.get(sender_address):
+                    self.send_hci_packet(
+                        hci.HCI_Keypress_Notification_Event(
+                            bd_addr=sender_address,
+                            notification_type=notification_type,
+                        )
+                    )
+
             case _:
                 logger.error("!!! Unhandled packet: %s", packet)
+
+    def _start_ssp_exchange(self, connection: Connection) -> None:
+        if connection.ssp_state.local_nonce is None:
+            connection.ssp_state.local_nonce = crypto.r()
+        connection.ssp_state.local_confirm = crypto.f4(
+            bytes(connection.self_address),
+            bytes(connection.peer_address),
+            connection.ssp_state.local_nonce,
+            bytes(1),
+        )
+        self.send_lmp_packet(
+            connection.peer_address,
+            lmp.LmpSimplePairingConfirm(commitment=connection.ssp_state.local_confirm),
+        )
+        self.send_lmp_packet(
+            connection.peer_address,
+            lmp.LmpSimplePairingNumber(nonce=connection.ssp_state.local_nonce),
+        )
+
+    def _on_ssp_confirm_or_nonce_received(self, connection: Connection) -> None:
+        if (
+            connection.ssp_state.local_nonce is not None
+            and connection.ssp_state.peer_nonce is not None
+        ):
+            # Check association model per spec (Vol 3, Part H, Table 2.4)
+            if (
+                connection.ssp_state.local_io_capability
+                == hci.IoCapability.NO_INPUT_NO_OUTPUT
+                or connection.ssp_state.peer_io_capability
+                == hci.IoCapability.NO_INPUT_NO_OUTPUT
+            ):
+                # Just Works
+                if connection.ssp_state.is_initiator:
+                    u = bytes(connection.self_address)
+                    v = bytes(connection.peer_address)
+                    x = connection.ssp_state.local_nonce
+                    y = connection.ssp_state.peer_nonce
+                else:
+                    u = bytes(connection.peer_address)
+                    v = bytes(connection.self_address)
+                    x = connection.ssp_state.peer_nonce
+                    y = connection.ssp_state.local_nonce
+                numeric_val = crypto.g2(u, v, x, y) % 1000000
+                self.send_hci_packet(
+                    hci.HCI_User_Confirmation_Request_Event(
+                        bd_addr=connection.peer_address,
+                        numeric_value=numeric_val,
+                    )
+                )
+            elif (
+                connection.ssp_state.local_io_capability
+                == hci.IoCapability.KEYBOARD_ONLY
+                or connection.ssp_state.peer_io_capability
+                == hci.IoCapability.KEYBOARD_ONLY
+            ):
+                # Passkey Entry
+                if connection.ssp_state.local_io_capability in (
+                    hci.IoCapability.DISPLAY_ONLY,
+                    hci.IoCapability.DISPLAY_YES_NO,
+                ):
+                    passkey = secrets.randbelow(1000000)
+                    connection.ssp_state.passkey = passkey
+                    connection.ssp_state.local_confirmed = True
+                    self.send_hci_packet(
+                        hci.HCI_User_Passkey_Notification_Event(
+                            bd_addr=connection.peer_address,
+                            passkey=passkey,
+                        )
+                    )
+                    self._check_ssp_completion(connection)
+                else:
+                    self.send_hci_packet(
+                        hci.HCI_User_Passkey_Request_Event(
+                            bd_addr=connection.peer_address
+                        )
+                    )
+            else:
+                # Numeric Comparison
+                if connection.ssp_state.is_initiator:
+                    u = bytes(connection.self_address)
+                    v = bytes(connection.peer_address)
+                    x = connection.ssp_state.local_nonce
+                    y = connection.ssp_state.peer_nonce
+                else:
+                    u = bytes(connection.peer_address)
+                    v = bytes(connection.self_address)
+                    x = connection.ssp_state.peer_nonce
+                    y = connection.ssp_state.local_nonce
+                numeric_val = crypto.g2(u, v, x, y) % 1000000
+                self.send_hci_packet(
+                    hci.HCI_User_Confirmation_Request_Event(
+                        bd_addr=connection.peer_address,
+                        numeric_value=numeric_val,
+                    )
+                )
+
+    def _check_ssp_completion(self, connection: Connection) -> None:
+        if (
+            connection.ssp_state.local_confirmed
+            and not connection.ssp_state.sent_dhkey_check
+        ):
+            n1 = connection.ssp_state.local_nonce or bytes(16)
+            n2 = connection.ssp_state.peer_nonce or bytes(16)
+            a1 = bytes(connection.self_address)
+            a2 = bytes(connection.peer_address)
+
+            r = (connection.ssp_state.passkey or 0).to_bytes(16, 'big')
+            local_io_cap_bytes = bytes(
+                [
+                    connection.ssp_state.local_io_capability or 0,
+                    connection.ssp_state.local_oob_data_present or 0,
+                    connection.ssp_state.local_auth_reqs or 0,
+                ]
+            )
+
+            dhkey_check = crypto.f6(
+                bytes(32),
+                n1,
+                n2,
+                r,
+                local_io_cap_bytes,
+                a1,
+                a2,
+            )
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpDhkeyCheck(check_value=dhkey_check),
+            )
+            connection.ssp_state.sent_dhkey_check = True
+
+        if connection.ssp_state.local_confirmed and connection.ssp_state.peer_confirmed:
+            if not connection.ssp_state.authenticated:
+                connection.ssp_state.authenticated = True
+                if connection.ssp_state.is_initiator:
+                    n1 = connection.ssp_state.local_nonce or bytes(16)
+                    n2 = connection.ssp_state.peer_nonce or bytes(16)
+                    a1 = bytes(connection.self_address)
+                    a2 = bytes(connection.peer_address)
+                else:
+                    n1 = connection.ssp_state.peer_nonce or bytes(16)
+                    n2 = connection.ssp_state.local_nonce or bytes(16)
+                    a1 = bytes(connection.peer_address)
+                    a2 = bytes(connection.self_address)
+
+                link_key = crypto.f5(bytes(32), n1, n2, a1, a2)[1]
+                connection.ssp_state.link_key = link_key
+
+                self.send_hci_packet(
+                    hci.HCI_Simple_Pairing_Complete_Event(
+                        status=hci.HCI_ErrorCode.SUCCESS,
+                        bd_addr=connection.peer_address,
+                    )
+                )
+                self.send_hci_packet(
+                    hci.HCI_Link_Key_Notification_Event(
+                        bd_addr=connection.peer_address,
+                        link_key=link_key,
+                        key_type=hci.LinkKeyType.AUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P_256,
+                    )
+                )
+                self.send_hci_packet(
+                    hci.HCI_Authentication_Complete_Event(
+                        status=hci.HCI_ErrorCode.SUCCESS,
+                        connection_handle=connection.handle,
+                    )
+                )
+
+    def _verify_peer_dhkey_check(
+        self, connection: Connection, check_value: bytes
+    ) -> None:
+        n1 = connection.ssp_state.peer_nonce or bytes(16)
+        n2 = connection.ssp_state.local_nonce or bytes(16)
+        a1 = bytes(connection.peer_address)
+        a2 = bytes(connection.self_address)
+
+        r = (connection.ssp_state.passkey or 0).to_bytes(16, 'big')
+        peer_io_cap_bytes = bytes(
+            [
+                connection.ssp_state.peer_io_capability or 0,
+                connection.ssp_state.peer_oob_data_present or 0,
+                connection.ssp_state.peer_auth_reqs or 0,
+            ]
+        )
+        expected_dhkey_check = crypto.f6(
+            bytes(32),
+            n1,
+            n2,
+            r,
+            peer_io_cap_bytes,
+            a1,
+            a2,
+        )
+        if check_value != expected_dhkey_check:
+            logger.error(
+                "DHKey check failed: expected %s, got %s",
+                expected_dhkey_check.hex(),
+                check_value.hex(),
+            )
+            self._on_ssp_failed(
+                connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+            )
+        else:
+            connection.ssp_state.peer_confirmed = True
+            self._check_ssp_completion(connection)
+
+    def _on_ssp_failed(self, connection: Connection, error_code: int) -> None:
+        self.send_hci_packet(
+            hci.HCI_Simple_Pairing_Complete_Event(
+                status=error_code,
+                bd_addr=connection.peer_address,
+            )
+        )
+        self.send_hci_packet(
+            hci.HCI_Authentication_Complete_Event(
+                status=error_code,
+                connection_handle=connection.handle,
+            )
+        )
 
     def on_classic_connection_request(
         self, peer_address: hci.Address, link_type: int
@@ -1824,6 +2158,279 @@ class Controller:
         else:
             self.lmp_features &= ~hci.LmpFeatureMask.SECURE_SIMPLE_PAIRING_HOST_SUPPORT
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
+
+    def on_hci_read_simple_pairing_mode_command(
+        self, _command: hci.HCI_Read_Simple_Pairing_Mode_Command
+    ) -> hci.HCI_Read_Simple_Pairing_Mode_ReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.3.58 Read Simple Pairing Mode Command
+        '''
+        return hci.HCI_Read_Simple_Pairing_Mode_ReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            simple_pairing_mode=(
+                1
+                if (
+                    self.lmp_features
+                    & hci.LmpFeatureMask.SECURE_SIMPLE_PAIRING_HOST_SUPPORT
+                )
+                else 0
+            ),
+        )
+
+    def on_hci_authentication_requested_command(
+        self, command: hci.HCI_Authentication_Requested_Command
+    ) -> None:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.19 Authentication Requested Command
+        '''
+        if not (
+            connection := self.find_classic_connection_by_handle(
+                command.connection_handle
+            )
+        ):
+            self._send_hci_command_status(
+                hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR, command.op_code
+            )
+            return
+        self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
+        connection.ssp_state.is_initiator = True
+        self.send_hci_packet(
+            hci.HCI_IO_Capability_Request_Event(bd_addr=connection.peer_address)
+        )
+
+    def on_hci_io_capability_request_reply_command(
+        self, command: hci.HCI_IO_Capability_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.29 IO Capability Request Reply Command
+        '''
+        if not (connection := self.classic_connections.get(command.bd_addr)):
+            return hci.HCI_StatusAndAddressReturnParameters(
+                status=hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR,
+                bd_addr=command.bd_addr,
+            )
+        connection.ssp_state.local_io_capability = command.io_capability
+        connection.ssp_state.local_oob_data_present = command.oob_data_present
+        connection.ssp_state.local_auth_reqs = command.authentication_requirements
+
+        if connection.ssp_state.is_initiator:
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpIoCapabilityReq(
+                    io_capability=command.io_capability,
+                    oob_data_present=command.oob_data_present,
+                    authentication_requirements=command.authentication_requirements,
+                ),
+            )
+        else:
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpIoCapabilityRes(
+                    io_capability=command.io_capability,
+                    oob_data_present=command.oob_data_present,
+                    authentication_requirements=command.authentication_requirements,
+                ),
+            )
+            if connection.ssp_state.peer_io_capability is not None:
+                self.send_hci_packet(
+                    hci.HCI_IO_Capability_Response_Event(
+                        bd_addr=connection.peer_address,
+                        io_capability=connection.ssp_state.peer_io_capability,
+                        oob_data_present=connection.ssp_state.peer_oob_data_present,
+                        authentication_requirements=connection.ssp_state.peer_auth_reqs,
+                    )
+                )
+                self._start_ssp_exchange(connection)
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_io_capability_request_negative_reply_command(
+        self, command: hci.HCI_IO_Capability_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.36 IO Capability Request Negative Reply
+        Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpNotAcceptedExt(
+                    response_opcode=lmp.Opcode.LMP_IO_CAPABILITY_REQ & 0xFF,
+                    error_code=command.reason,
+                ),
+            )
+            self._on_ssp_failed(connection, command.reason)
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_user_confirmation_request_reply_command(
+        self, command: hci.HCI_User_Confirmation_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.30 User Confirmation Request Reply
+        Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            connection.ssp_state.local_confirmed = True
+            self._check_ssp_completion(connection)
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_user_confirmation_request_negative_reply_command(
+        self, command: hci.HCI_User_Confirmation_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.31 User Confirmation Request Negative Reply
+        Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpNumericComparisonFailed(),
+            )
+            self._on_ssp_failed(
+                connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+            )
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_user_passkey_request_reply_command(
+        self, command: hci.HCI_User_Passkey_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.32 User Passkey Request Reply Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            connection.ssp_state.passkey = command.numeric_value
+            connection.ssp_state.local_confirmed = True
+            if pending_check := connection.ssp_state.pending_peer_dhkey_check:
+                connection.ssp_state.pending_peer_dhkey_check = None
+                self._verify_peer_dhkey_check(connection, pending_check)
+            else:
+                self._check_ssp_completion(connection)
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_user_passkey_request_negative_reply_command(
+        self, command: hci.HCI_User_Passkey_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.33 User Passkey Request Negative Reply
+        Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpPasskeyFailed(),
+            )
+            self._on_ssp_failed(
+                connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+            )
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_remote_oob_data_request_reply_command(
+        self, command: hci.HCI_Remote_OOB_Data_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.34 Remote OOB Data Request Reply Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            connection.ssp_state.oob_c = command.c
+            connection.ssp_state.oob_r = command.r
+            connection.ssp_state.local_confirmed = True
+            self._check_ssp_completion(connection)
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_remote_oob_data_request_negative_reply_command(
+        self, command: hci.HCI_Remote_OOB_Data_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.35 Remote OOB Data Request Negative Reply
+        Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpOobFailed(),
+            )
+            self._on_ssp_failed(
+                connection, hci.HCI_ErrorCode.AUTHENTICATION_FAILURE_ERROR
+            )
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_send_keypress_notification_command(
+        self, command: hci.HCI_Send_Keypress_Notification_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.37 Send Keypress Notification Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            self.send_lmp_packet(
+                connection.peer_address,
+                lmp.LmpKeypressNotification(
+                    notification_type=command.notification_type
+                ),
+            )
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_link_key_request_reply_command(
+        self, command: hci.HCI_Link_Key_Request_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.10 Link Key Request Reply Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            connection.ssp_state.link_key = command.link_key
+            connection.ssp_state.authenticated = True
+            self.send_hci_packet(
+                hci.HCI_Authentication_Complete_Event(
+                    status=hci.HCI_ErrorCode.SUCCESS,
+                    connection_handle=connection.handle,
+                )
+            )
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
+
+    def on_hci_link_key_request_negative_reply_command(
+        self, command: hci.HCI_Link_Key_Request_Negative_Reply_Command
+    ) -> hci.HCI_StatusAndAddressReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.1.11 Link Key Request Negative Reply
+        Command
+        '''
+        if connection := self.classic_connections.get(command.bd_addr):
+            connection.ssp_state.is_initiator = True
+            self.send_hci_packet(
+                hci.HCI_IO_Capability_Request_Event(bd_addr=connection.peer_address)
+            )
+        return hci.HCI_StatusAndAddressReturnParameters(
+            status=hci.HCI_ErrorCode.SUCCESS,
+            bd_addr=command.bd_addr,
+        )
 
     def on_hci_set_event_mask_page_2_command(
         self, command: hci.HCI_Set_Event_Mask_Page_2_Command
