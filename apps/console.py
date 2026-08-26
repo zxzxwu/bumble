@@ -20,14 +20,14 @@
 # Imports
 # -----------------------------------------------------------------------------
 import asyncio
+import datetime
 import logging
 import os
 import re
 from collections import OrderedDict
+from typing import Any
 
 import click
-import humanize
-from prettytable import PrettyTable
 from prompt_toolkit import Application
 from prompt_toolkit.completion import Completer, Completion, NestedCompleter
 from prompt_toolkit.data_structures import Point
@@ -119,6 +119,55 @@ def parse_phys(phys):
         else:
             raise ValueError('invalid PHY name')
     return phy_list
+
+
+def natural_time(dt: datetime.datetime) -> str:
+    now = datetime.datetime.now()
+    if dt > now:
+        delta = datetime.timedelta(seconds=0)
+    else:
+        delta = now - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 1:
+        return 'now'
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''} ago"
+    if seconds < 3600:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    if seconds < 86400:
+        hours = seconds // 3600
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = seconds // 86400
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
+
+def format_table(field_names: list[str], rows: list[list[Any]]) -> str:
+    if not field_names:
+        return ''
+    widths = [len(str(h)) for h in field_names]
+    for row in rows:
+        for i, val in enumerate(row):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(str(val)))
+            else:
+                widths.append(len(str(val)))
+
+    border = '+' + '+'.join('-' * (w + 2) for w in widths) + '+'
+    header = (
+        '| '
+        + ' | '.join(f'{str(h):<{widths[i]}}' for i, h in enumerate(field_names))
+        + ' |'
+    )
+    body = [
+        '| ' + ' | '.join(f'{str(v):<{widths[i]}}' for i, v in enumerate(row)) + ' |'
+        for row in rows
+    ]
+    lines = [border, header, border]
+    if body:
+        lines.extend(body)
+    lines.append(border)
+    return '\n'.join(lines)
 
 
 # -----------------------------------------------------------------------------
@@ -579,7 +628,7 @@ class ConsoleApp:
 
     async def command(self, command):
         try:
-            (keyword, *params) = command.strip().split(' ')
+            keyword, *params = command.strip().split(' ')
             keyword = keyword.replace('-', '_').lower()
             handler = getattr(self, f'do_{keyword}', None)
             if handler:
@@ -745,7 +794,6 @@ class ConsoleApp:
             await asyncio.sleep(1)
 
     async def do_show_local_values(self):
-        prettytable = PrettyTable()
         field_names = ["Service", "Characteristic", "Descriptor"]
 
         # if there's no connections, add a column just for value
@@ -756,6 +804,7 @@ class ConsoleApp:
         for connection in self.device.connections.values():
             field_names.append(f"Connection {connection.handle}")
 
+        rows = []
         for attribute in self.device.gatt_server.attributes:
             if isinstance(attribute, Characteristic):
                 service = self.device.gatt_server.get_attribute_group(
@@ -769,7 +818,7 @@ class ConsoleApp:
                 ]
                 if not values:
                     values = [attribute.read_value(None)]
-                prettytable.add_row([f"{service.uuid}", attribute.uuid, ""] + values)
+                rows.append([f"{service.uuid}", attribute.uuid, ""] + values)
 
             elif isinstance(attribute, Descriptor):
                 service = self.device.gatt_server.get_attribute_group(
@@ -791,25 +840,23 @@ class ConsoleApp:
 
                 # TODO: future optimization: convert CCCD value to human readable string
 
-                prettytable.add_row(
+                rows.append(
                     [service.uuid, characteristic.uuid, attribute.type] + values
                 )
 
-        prettytable.field_names = field_names
-        self.local_values_text.text = prettytable.get_string()
+        self.local_values_text.text = format_table(field_names, rows)
         self.ui.invalidate()
 
     async def do_show_remote_values(self):
-        prettytable = PrettyTable(
-            field_names=[
-                "Connection",
-                "Service",
-                "Characteristic",
-                "Descriptor",
-                "Time",
-                "Value",
-            ]
-        )
+        field_names = [
+            "Connection",
+            "Service",
+            "Characteristic",
+            "Descriptor",
+            "Time",
+            "Value",
+        ]
+        rows = []
         for connection in self.device.connections.values():
             for handle, (time, value) in connection.gatt_client.cached_values.items():
                 row = [connection.handle]
@@ -827,10 +874,10 @@ class ConsoleApp:
                 else:
                     continue
 
-                row.extend([humanize.naturaltime(time), value])
-                prettytable.add_row(row)
+                row.extend([natural_time(time), value])
+                rows.append(row)
 
-        self.remote_values_text.text = prettytable.get_string()
+        self.remote_values_text.text = format_table(field_names, rows)
         self.ui.invalidate()
 
     async def do_get_phy(self, _):

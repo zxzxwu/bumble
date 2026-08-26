@@ -23,7 +23,6 @@ import os
 from typing import ClassVar
 
 import click
-from prompt_toolkit.shortcuts import PromptSession
 
 from bumble import data_types, smp
 from bumble.a2dp import make_audio_sink_service_sdp_records
@@ -104,8 +103,7 @@ class Delegate(PairingDelegate):
         # Wait a bit to allow some of the log lines to print before we prompt
         await asyncio.sleep(1)
 
-        session = PromptSession(message)
-        response = await session.prompt_async()
+        response = await asyncio.to_thread(input, message)
         return response.lower().strip()
 
     async def update_peer_name(self):
