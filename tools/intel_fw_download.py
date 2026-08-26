@@ -50,7 +50,7 @@ def download_file(base_url, name):
 
 
 # -----------------------------------------------------------------------------
-@click.command
+@click.command()
 @click.option(
     "--output-dir",
     default="",
@@ -66,15 +66,15 @@ def download_file(base_url, name):
 )
 @click.option("--single", help="Only download a single image set, by its base name")
 @click.option("--force", is_flag=True, help="Overwrite files if they already exist")
-def main(output_dir, source, single, force):
+def main(output_dir: str, source: str, single: str | None, force: bool) -> None:
     """Download Intel firmware images and configs."""
 
     # Check that the output dir exists
     if output_dir == '':
-        output_dir = intel.intel_firmware_dir()
+        out_dir = intel.intel_firmware_dir()
     else:
-        output_dir = pathlib.Path(output_dir)
-    if not output_dir.is_dir():
+        out_dir = pathlib.Path(output_dir)
+    if not out_dir.is_dir():
         print("Output dir does not exist or is not a directory")
         return
 
@@ -84,7 +84,7 @@ def main(output_dir, source, single, force):
 
     print("Downloading")
     print(color("FROM:", "green"), base_url)
-    print(color("TO:", "green"), output_dir)
+    print(color("TO:", "green"), out_dir)
 
     if single:
         images = [(f"{single}.sfi", f"{single}.ddc")]
@@ -96,12 +96,12 @@ def main(output_dir, source, single, force):
 
     for fw_name, config_name in images:
         print(color("---", "yellow"))
-        fw_image_out = output_dir / fw_name
+        fw_image_out = out_dir / fw_name
         if not force and fw_image_out.exists():
             print(color(f"{fw_image_out} already exists, skipping", "red"))
             continue
         if config_name:
-            config_image_out = output_dir / config_name
+            config_image_out = out_dir / config_name
             if not force and config_image_out.exists():
                 print(color("f{config_image_out} already exists, skipping", "red"))
                 continue

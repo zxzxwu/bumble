@@ -22,9 +22,9 @@ import datetime
 import functools
 import json
 import logging
+import pathlib
 import wave
 import weakref
-from importlib import resources
 
 try:
     import lc3  # type: ignore  # pylint: disable=E0401
@@ -161,21 +161,30 @@ class UiServer:
     speaker: weakref.ReferenceType[Speaker]
     port: int
     channel_socket: websockets.asyncio.server.ServerConnection | None
+    server: websockets.asyncio.server.Server | None
 
     def __init__(self, speaker: Speaker, port: int) -> None:
         self.speaker = weakref.ref(speaker)
         self.port = port
         self.channel_socket = None
+        self.server = None
 
     async def start_http(self) -> None:
         """Start the UI HTTP server."""
-        await websockets.asyncio.server.serve(
+        self.server = await websockets.asyncio.server.serve(
             self.get_channel,
-            'localhost',
+            '127.0.0.1',
             self.port,
             process_request=self.process_request,
         )
+        if self.port == 0 and self.server.sockets:
+            self.port = self.server.sockets[0].getsockname()[1]
         print('UI HTTP server at ' + color(f'http://127.0.0.1:{self.port}', 'green'))
+
+    async def close(self) -> None:
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
 
     async def process_request(
         self,
@@ -201,11 +210,7 @@ class UiServer:
             content_type = 'text/plain; charset=utf-8'
 
         try:
-            body = (
-                resources.files("bumble.apps.lea_unicast")
-                .joinpath(path.lstrip('/'))
-                .read_bytes()
-            )
+            body = (pathlib.Path(__file__).parent / path.lstrip('/')).read_bytes()
             return websockets.http11.Response(
                 status_code=200,
                 reason_phrase='OK',

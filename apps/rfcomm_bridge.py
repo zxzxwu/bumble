@@ -507,7 +507,11 @@ def client(context, bluetooth_address, tcp_host, tcp_port, authenticate, encrypt
     asyncio.run(run(context.obj["device_config"], context.obj["hci_transport"], bridge))
 
 
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
+def main() -> None:
     bumble.logging.setup_basic_logging("WARNING")
     cli(obj={})  # pylint: disable=no-value-for-parameter
+
+
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()

@@ -21,11 +21,11 @@ import urllib.error
 import urllib.request
 
 import click
-from bumble.tools import rtk_util
 
 import bumble.logging
 from bumble.colors import color
 from bumble.drivers import rtk
+from tools import rtk_util
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -67,7 +67,7 @@ def download_file(base_url, name, remove_suffix):
 
 
 # -----------------------------------------------------------------------------
-@click.command
+@click.command()
 @click.option(
     "--output-dir",
     default="",
@@ -84,16 +84,18 @@ def download_file(base_url, name, remove_suffix):
 @click.option("--single", help="Only download a single image set, by its base name")
 @click.option("--force", is_flag=True, help="Overwrite files if they already exist")
 @click.option("--parse", is_flag=True, help="Parse the FW image after saving")
-def main(output_dir, source, single, force, parse):
+def main(
+    output_dir: str, source: str, single: str | None, force: bool, parse: bool
+) -> None:
     """Download RTK firmware images and configs."""
     bumble.logging.setup_basic_logging()
 
     # Check that the output dir exists
     if output_dir == '':
-        output_dir = rtk.rtk_firmware_dir()
+        out_dir = rtk.rtk_firmware_dir()
     else:
-        output_dir = pathlib.Path(output_dir)
-    if not output_dir.is_dir():
+        out_dir = pathlib.Path(output_dir)
+    if not out_dir.is_dir():
         print("Output dir does not exist or is not a directory")
         return
 
@@ -105,7 +107,7 @@ def main(output_dir, source, single, force, parse):
 
     print("Downloading")
     print(color("FROM:", "green"), base_url)
-    print(color("TO:", "green"), output_dir)
+    print(color("TO:", "green"), out_dir)
 
     if single:
         images = [(f"{single}_fw.bin", f"{single}_config.bin", True)]
@@ -117,12 +119,12 @@ def main(output_dir, source, single, force, parse):
 
     for fw_name, config_name, config_needed in images:
         print(color("---", "yellow"))
-        fw_image_out = output_dir / fw_name
+        fw_image_out = out_dir / fw_name
         if not force and fw_image_out.exists():
             print(color(f"{fw_image_out} already exists, skipping", "red"))
             continue
         if config_name:
-            config_image_out = output_dir / config_name
+            config_image_out = out_dir / config_name
             if not force and config_image_out.exists():
                 print(color("f{config_out} already exists, skipping", "red"))
                 continue

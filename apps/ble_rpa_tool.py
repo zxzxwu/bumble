@@ -52,11 +52,10 @@ def verify_rpa(irk: str, rpa: str) -> None:
         print(color("Not Verified", "red"))
 
 
-def main():
-    cli.add_command(gen_irk)
-    cli.add_command(gen_rpa)
-    cli.add_command(verify_rpa)
-    cli()
+cli.add_command(gen_irk)
+cli.add_command(gen_rpa)
+cli.add_command(verify_rpa)
+main = cli
 
 
 # -----------------------------------------------------------------------------
