@@ -22,7 +22,6 @@ import datetime
 import functools
 import json
 import logging
-import pathlib
 import wave
 import weakref
 from importlib import resources
@@ -32,8 +31,10 @@ try:
 except ImportError as e:
     raise ImportError("Try `python -m pip install \".[auracast]\"`.") from e
 
-import aiohttp.web
 import click
+import websockets.asyncio.server
+import websockets.exceptions
+import websockets.http11
 
 import bumble
 import bumble.logging
@@ -159,6 +160,7 @@ async def lc3_source_task(
 class UiServer:
     speaker: weakref.ReferenceType[Speaker]
     port: int
+    channel_socket: websockets.asyncio.server.ServerConnection | None
 
     def __init__(self, speaker: Speaker, port: int) -> None:
         self.speaker = weakref.ref(speaker)
@@ -167,62 +169,83 @@ class UiServer:
 
     async def start_http(self) -> None:
         """Start the UI HTTP server."""
-
-        app = aiohttp.web.Application()
-        app.add_routes(
-            [
-                aiohttp.web.get('/', self.get_static),
-                aiohttp.web.get('/index.html', self.get_static),
-                aiohttp.web.get('/channel', self.get_channel),
-            ]
+        await websockets.asyncio.server.serve(
+            self.get_channel,
+            'localhost',
+            self.port,
+            process_request=self.process_request,
         )
-
-        runner = aiohttp.web.AppRunner(app)
-        await runner.setup()
-        site = aiohttp.web.TCPSite(runner, 'localhost', self.port)
         print('UI HTTP server at ' + color(f'http://127.0.0.1:{self.port}', 'green'))
-        await site.start()
 
-    async def get_static(self, request):
+    async def process_request(
+        self,
+        connection: websockets.asyncio.server.ServerConnection,
+        request: websockets.asyncio.server.Request,
+    ) -> websockets.http11.Response | None:
         path = request.path
-        if path == '/':
+        if path == '/channel':
+            return None
+
+        if path in ('', '/'):
             path = '/index.html'
+
         if path.endswith('.html'):
-            content_type = 'text/html'
+            content_type = 'text/html; charset=utf-8'
         elif path.endswith('.js'):
-            content_type = 'text/javascript'
+            content_type = 'text/javascript; charset=utf-8'
         elif path.endswith('.css'):
-            content_type = 'text/css'
+            content_type = 'text/css; charset=utf-8'
         elif path.endswith('.svg'):
             content_type = 'image/svg+xml'
         else:
-            content_type = 'text/plain'
-        text = (
-            resources.files("bumble.apps.lea_unicast")
-            .joinpath(pathlib.Path(path).relative_to('/'))
-            .read_text(encoding="utf-8")
-        )
-        return aiohttp.web.Response(text=text, content_type=content_type)
+            content_type = 'text/plain; charset=utf-8'
 
-    async def get_channel(self, request):
-        ws = aiohttp.web.WebSocketResponse()
-        await ws.prepare(request)
+        try:
+            body = (
+                resources.files("bumble.apps.lea_unicast")
+                .joinpath(path.lstrip('/'))
+                .read_bytes()
+            )
+            return websockets.http11.Response(
+                status_code=200,
+                reason_phrase='OK',
+                headers=websockets.http11.Headers(
+                    [
+                        ('Content-Type', content_type),
+                        ('Content-Length', str(len(body))),
+                    ]
+                ),
+                body=body,
+            )
+        except Exception:
+            body = b'Not Found'
+            return websockets.http11.Response(
+                status_code=404,
+                reason_phrase='Not Found',
+                headers=websockets.http11.Headers(
+                    [
+                        ('Content-Type', 'text/plain; charset=utf-8'),
+                        ('Content-Length', str(len(body))),
+                    ]
+                ),
+                body=body,
+            )
 
+    async def get_channel(self, ws: websockets.asyncio.server.ServerConnection) -> None:
         # Process messages until the socket is closed.
         self.channel_socket = ws
-        async for message in ws:
-            if message.type == aiohttp.WSMsgType.TEXT:
-                logger.debug(f'<<< received message: {message.data}')
-                await self.on_message(message.data)
-            elif message.type == aiohttp.WSMsgType.ERROR:
-                logger.debug(
-                    f'channel connection closed with exception {ws.exception()}'
-                )
-
-        self.channel_socket = None
-        logger.debug('--- channel connection closed')
-
-        return ws
+        try:
+            async for message in ws:
+                if isinstance(message, str):
+                    logger.debug(f'<<< received message: {message}')
+                    await self.on_message(message)
+                else:
+                    logger.debug(f'<<< received binary message: {len(message)} bytes')
+        except websockets.exceptions.ConnectionClosed as error:
+            logger.debug(f'channel connection closed: {error}')
+        finally:
+            self.channel_socket = None
+            logger.debug('--- channel connection closed')
 
     async def on_message(self, message_str: str):
         # Parse the message as JSON
@@ -231,18 +254,21 @@ class UiServer:
         # Dispatch the message
         message_type = message['type']
         message_params = message.get('params', {})
-        handler = getattr(self, f'on_{message_type}_message')
+        handler = getattr(self, f'on_{message_type}_message', None)
         if handler:
             await handler(**message_params)
 
     async def on_hello_message(self):
+        speaker = self.speaker()
+        if not speaker:
+            return
         await self.send_message(
             'hello',
             bumble_version=bumble.__version__,
-            codec=self.speaker().codec,
-            streamState=self.speaker().stream_state.name,
+            codec=speaker.codec,
+            streamState=speaker.stream_state.name,
         )
-        if connection := self.speaker().connection:
+        if connection := speaker.connection:
             await self.send_message(
                 'connection',
                 peer_address=connection.peer_address.to_string(False),
@@ -254,14 +280,14 @@ class UiServer:
             return
 
         message = {'type': message_type, 'params': kwargs}
-        await self.channel_socket.send_json(message)
+        await self.channel_socket.send(json.dumps(message))
 
     async def send_audio(self, data: bytes) -> None:
         if self.channel_socket is None:
             return
 
         try:
-            await self.channel_socket.send_bytes(data)
+            await self.channel_socket.send(data)
         except Exception as error:
             logger.warning(f'exception while sending audio packet: {error}')
 
