@@ -1049,8 +1049,9 @@ class Controller:
         if isinstance(pdu, ll.AdvExtInd):
             direct_address = pdu.target_address
             sync_key = (pdu.advertiser_address, pdu.sid)
-            if sync_key in self.pending_periodic_advertising_syncs:
-                sync_handle = self.pending_periodic_advertising_syncs.pop(sync_key)
+            if sync_handle := self.pending_periodic_advertising_syncs.pop(
+                sync_key, None
+            ):
                 self.established_periodic_advertising_syncs[sync_handle] = sync_key
                 self.send_hci_packet(
                     hci.HCI_LE_Periodic_Advertising_Sync_Established_Event(
@@ -1064,9 +1065,10 @@ class Controller:
                         advertiser_clock_accuracy=0,
                     )
                 )
-            for sync_handle, (adv_addr, sid) in list(
-                self.established_periodic_advertising_syncs.items()
-            ):
+            for sync_handle, (
+                adv_addr,
+                sid,
+            ) in self.established_periodic_advertising_syncs.items():
                 if (
                     adv_addr == pdu.advertiser_address
                     and sid == pdu.sid
@@ -3789,8 +3791,7 @@ class Controller:
         self.pending_periodic_advertising_syncs[sync_key] = sync_handle
 
         def on_sync_timeout() -> None:
-            if sync_key in self.pending_periodic_advertising_syncs:
-                handle = self.pending_periodic_advertising_syncs.pop(sync_key)
+            if handle := self.pending_periodic_advertising_syncs.pop(sync_key, None):
                 self.send_hci_packet(
                     hci.HCI_LE_Periodic_Advertising_Sync_Established_Event(
                         status=hci.HCI_ErrorCode.CONNECTION_FAILED_TO_BE_ESTABLISHED_ERROR,
