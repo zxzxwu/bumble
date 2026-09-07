@@ -3785,9 +3785,53 @@ class Controller:
         '''
         self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
         sync_handle = 0x0010 + command.advertising_sid
-        self.pending_periodic_advertising_syncs[
-            (command.advertiser_address, command.advertising_sid)
-        ] = sync_handle
+        sync_key = (command.advertiser_address, command.advertising_sid)
+        self.pending_periodic_advertising_syncs[sync_key] = sync_handle
+
+        def on_sync_timeout() -> None:
+            if sync_key in self.pending_periodic_advertising_syncs:
+                handle = self.pending_periodic_advertising_syncs.pop(sync_key)
+                self.send_hci_packet(
+                    hci.HCI_LE_Periodic_Advertising_Sync_Established_Event(
+                        status=hci.HCI_ErrorCode.CONNECTION_FAILED_TO_BE_ESTABLISHED_ERROR,
+                        sync_handle=handle,
+                        advertising_sid=command.advertising_sid,
+                        advertiser_address_type=command.advertiser_address.address_type,
+                        advertiser_address=command.advertiser_address,
+                        advertiser_phy=hci.Phy.LE_1M,
+                        periodic_advertising_interval=0,
+                        advertiser_clock_accuracy=0,
+                    )
+                )
+
+        timeout_s = command.sync_timeout * 0.01
+        asyncio.get_running_loop().call_later(timeout_s, on_sync_timeout)
+
+    def on_hci_le_periodic_advertising_create_sync_cancel_command(
+        self, _command: hci.HCI_LE_Periodic_Advertising_Create_Sync_Cancel_Command
+    ) -> hci.HCI_StatusReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.8.68 LE Periodic Advertising Create Sync Cancel
+        Command
+        '''
+        if not self.pending_periodic_advertising_syncs:
+            return hci.HCI_StatusReturnParameters(
+                hci.HCI_ErrorCode.COMMAND_DISALLOWED_ERROR
+            )
+        (adv_addr, sid), sync_handle = self.pending_periodic_advertising_syncs.popitem()
+        self.send_hci_packet(
+            hci.HCI_LE_Periodic_Advertising_Sync_Established_Event(
+                status=hci.HCI_ErrorCode.OPERATION_CANCELLED_BY_HOST_ERROR,
+                sync_handle=sync_handle,
+                advertising_sid=sid,
+                advertiser_address_type=adv_addr.address_type,
+                advertiser_address=adv_addr,
+                advertiser_phy=hci.Phy.LE_1M,
+                periodic_advertising_interval=0,
+                advertiser_clock_accuracy=0,
+            )
+        )
+        return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
 
     def on_hci_le_periodic_advertising_terminate_sync_command(
         self, command: hci.HCI_LE_Periodic_Advertising_Terminate_Sync_Command
