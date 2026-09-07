@@ -149,10 +149,13 @@ class AdvertisingSet:
 
         self.send_extended_advertising_data()
 
-        interval = (
-            self.parameters.primary_advertising_interval_min * 0.625 / 1000.0
-            if self.parameters
-            else 1.0
+        interval = min(
+            (
+                self.parameters.primary_advertising_interval_min * 0.625 / 1000.0
+                if self.parameters
+                else 1.0
+            ),
+            0.01,
         )
         self.timer_handle = asyncio.get_running_loop().call_later(
             interval, self._on_extended_advertising_timer_fired
@@ -172,8 +175,19 @@ class AdvertisingSet:
         if self.controller.link:
             address = self.address
             assert address
-
-            self.controller.send_advertising_pdu(ll.AdvInd(address, bytes(self.data)))
+            sid = self.parameters.advertising_sid if self.parameters else 0
+            self.controller.send_advertising_pdu(
+                ll.AdvExtInd(
+                    advertiser_address=address,
+                    data=bytes(self.data),
+                    sid=sid,
+                    periodic_advertising_data=(
+                        bytes(self.periodic_advertising_data)
+                        if self.periodic_advertising_data
+                        else None
+                    ),
+                )
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -422,6 +436,10 @@ class Controller:
         self.central_cis_links = {}
         self.peripheral_cis_links = {}
         self.advertising_sets = {}
+        self.pending_periodic_advertising_syncs: dict[tuple[hci.Address, int], int] = {}
+        self.established_periodic_advertising_syncs: dict[
+            int, tuple[hci.Address, int]
+        ] = {}
         self.default_phy = {
             'all_phys': 0,
             'tx_phys': 0,
@@ -1030,6 +1048,40 @@ class Controller:
     def on_advertising_pdu(self, pdu: ll.AdvInd | ll.AdvExtInd) -> None:
         if isinstance(pdu, ll.AdvExtInd):
             direct_address = pdu.target_address
+            sync_key = (pdu.advertiser_address, pdu.sid)
+            if sync_key in self.pending_periodic_advertising_syncs:
+                sync_handle = self.pending_periodic_advertising_syncs.pop(sync_key)
+                self.established_periodic_advertising_syncs[sync_handle] = sync_key
+                self.send_hci_packet(
+                    hci.HCI_LE_Periodic_Advertising_Sync_Established_Event(
+                        status=hci.HCI_ErrorCode.SUCCESS,
+                        sync_handle=sync_handle,
+                        advertising_sid=pdu.sid,
+                        advertiser_address_type=pdu.advertiser_address.address_type,
+                        advertiser_address=pdu.advertiser_address,
+                        advertiser_phy=hci.Phy.LE_1M,
+                        periodic_advertising_interval=80,
+                        advertiser_clock_accuracy=0,
+                    )
+                )
+            for sync_handle, (adv_addr, sid) in list(
+                self.established_periodic_advertising_syncs.items()
+            ):
+                if (
+                    adv_addr == pdu.advertiser_address
+                    and sid == pdu.sid
+                    and pdu.periodic_advertising_data is not None
+                ):
+                    self.send_hci_packet(
+                        hci.HCI_LE_Periodic_Advertising_Report_Event(
+                            sync_handle=sync_handle,
+                            tx_power=0,
+                            rssi=-50,
+                            cte_type=0xFF,
+                            data_status=0,
+                            data=pdu.periodic_advertising_data,
+                        )
+                    )
         else:
             direct_address = None
 
@@ -2796,7 +2848,7 @@ class Controller:
                 supervision_timeout=command.supervision_timeout,
             )
         )
-        if connection := self.find_connection_by_handle(command.connection_handle):
+        if connection := self.find_le_connection_by_handle(command.connection_handle):
             connection.send_ll_control_pdu(
                 ll.SubrateInd(
                     subrate_factor=2,
@@ -3474,12 +3526,17 @@ class Controller:
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
 
     def on_hci_le_set_periodic_advertising_enable_command(
-        self, _command: hci.HCI_LE_Set_Periodic_Advertising_Enable_Command
+        self, command: hci.HCI_LE_Set_Periodic_Advertising_Enable_Command
     ) -> hci.HCI_StatusReturnParameters:
         '''
         See Bluetooth spec Vol 4, Part E - 7.8.63 LE Set Periodic Advertising Enable
         Command
         '''
+        if adv_set := self.advertising_sets.get(command.advertising_handle):
+            if command.enable & 0x01:
+                adv_set.start()
+            else:
+                adv_set.stop()
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
 
     def on_hci_le_read_transmit_power_command(
@@ -3656,11 +3713,8 @@ class Controller:
         '''
         See Bluetooth spec Vol 4, Part E - 7.8.18 LE Connection Update Command
         '''
-        if (
-            not (
-                connection := self.find_connection_by_handle(command.connection_handle)
-            )
-            or connection.transport != PhysicalTransport.LE
+        if not (
+            connection := self.find_le_connection_by_handle(command.connection_handle)
         ):
             self._send_hci_command_status(
                 hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR, command.op_code
@@ -3692,11 +3746,8 @@ class Controller:
         '''
         See Bluetooth spec Vol 6, Part E - 7.8.125 LE Connection Rate Request Command
         '''
-        if (
-            not (
-                connection := self.find_connection_by_handle(command.connection_handle)
-            )
-            or connection.transport != PhysicalTransport.LE
+        if not (
+            connection := self.find_le_connection_by_handle(command.connection_handle)
         ):
             self._send_hci_command_status(
                 hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR, command.op_code
@@ -3734,41 +3785,17 @@ class Controller:
         '''
         self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
         sync_handle = 0x0010 + command.advertising_sid
-        self.send_hci_packet(
-            hci.HCI_LE_Periodic_Advertising_Sync_Established_Event(
-                status=hci.HCI_ErrorCode.SUCCESS,
-                sync_handle=sync_handle,
-                advertising_sid=command.advertising_sid,
-                advertiser_address_type=command.advertiser_address_type,
-                advertiser_address=command.advertiser_address,
-                advertiser_phy=hci.Phy.LE_1M,
-                periodic_advertising_interval=80,
-                advertiser_clock_accuracy=0,
-            )
-        )
-        if self.link:
-            for c in self.link.controllers:
-                if c != self:
-                    adv_set = c.advertising_sets.get(command.advertising_sid)
-                    if adv_set and adv_set.periodic_advertising_data:
-                        self.send_hci_packet(
-                            hci.HCI_LE_Periodic_Advertising_Report_Event(
-                                sync_handle=sync_handle,
-                                tx_power=0,
-                                rssi=-50,
-                                cte_type=0xFF,
-                                data_status=0,
-                                data=bytes(adv_set.periodic_advertising_data),
-                            )
-                        )
-                        break
+        self.pending_periodic_advertising_syncs[
+            (command.advertiser_address, command.advertising_sid)
+        ] = sync_handle
 
     def on_hci_le_periodic_advertising_terminate_sync_command(
-        self, _command: hci.HCI_LE_Periodic_Advertising_Terminate_Sync_Command
+        self, command: hci.HCI_LE_Periodic_Advertising_Terminate_Sync_Command
     ) -> hci.HCI_StatusReturnParameters:
         '''
         See Bluetooth spec Vol 4, Part E - 7.8.69 LE Periodic Advertising Terminate Sync Command
         '''
+        self.established_periodic_advertising_syncs.pop(command.sync_handle, None)
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
 
     def on_hci_le_create_big_command(
@@ -3852,7 +3879,7 @@ class Controller:
         '''
         self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
         if command.create_context == 1 and (
-            connection := self.find_connection_by_handle(command.connection_handle)
+            connection := self.find_le_connection_by_handle(command.connection_handle)
         ):
             peer_role = (
                 hci.CsRole.REFLECTOR
@@ -3915,7 +3942,7 @@ class Controller:
         See Bluetooth spec Vol 4, Part E - LE CS Security Enable Command
         '''
         self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
-        if connection := self.find_connection_by_handle(command.connection_handle):
+        if connection := self.find_le_connection_by_handle(command.connection_handle):
             connection.send_ll_control_pdu(ll.CsSecReq())
 
     def on_hci_le_cs_set_procedure_parameters_command(
@@ -3936,7 +3963,7 @@ class Controller:
         See Bluetooth spec Vol 4, Part E - LE CS Procedure Enable Command
         '''
         self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
-        if connection := self.find_connection_by_handle(command.connection_handle):
+        if connection := self.find_le_connection_by_handle(command.connection_handle):
             connection.send_ll_control_pdu(
                 ll.CsReq(
                     config_id=command.config_id,

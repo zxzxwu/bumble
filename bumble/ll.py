@@ -70,7 +70,9 @@ class AdvExtInd(AdvertisingPdu):
 
     target_address: hci.Address | None = None
     adi: int | None = None
+    sid: int = 0
     tx_power: int | None = None
+    periodic_advertising_data: bytes | None = None
 
 
 # -----------------------------------------------------------------------------

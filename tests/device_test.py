@@ -1304,11 +1304,27 @@ async def test_periodic_advertising_sync():
     )
     await adv_set.start_periodic()
 
+    established = asyncio.Event()
+    report_received = asyncio.Event()
+    received_reports = []
+
     sync = await two_devices.devices[1].create_periodic_advertising_sync(
         advertiser_address=two_devices.devices[0].random_address,
         sid=0,
     )
+    sync.on('establishment', established.set)
+    sync.on(
+        'periodic_advertisement',
+        lambda report: (received_reports.append(report), report_received.set()),
+    )
+
+    if sync.state != PeriodicAdvertisingSync.State.ESTABLISHED:
+        await asyncio.wait_for(established.wait(), _TIMEOUT)
     assert sync.state == PeriodicAdvertisingSync.State.ESTABLISHED
+
+    await asyncio.wait_for(report_received.wait(), _TIMEOUT)
+    assert len(received_reports) > 0
+
     await sync.terminate()
     assert sync.state == PeriodicAdvertisingSync.State.TERMINATED
 
@@ -1345,10 +1361,15 @@ async def test_big_and_big_sync():
     )
     assert len(big.bis_links) == 2
 
+    established = asyncio.Event()
     pa_sync = await two_devices.devices[1].create_periodic_advertising_sync(
         advertiser_address=two_devices.devices[0].random_address,
         sid=0,
     )
+    pa_sync.on('establishment', established.set)
+    if pa_sync.state != PeriodicAdvertisingSync.State.ESTABLISHED:
+        await asyncio.wait_for(established.wait(), _TIMEOUT)
+
     big_sync = await two_devices.devices[1].create_big_sync(
         pa_sync,
         BigSyncParameters(big_sync_timeout=1000, bis=[1, 2]),
